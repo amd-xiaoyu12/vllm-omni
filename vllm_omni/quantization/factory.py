@@ -125,6 +125,13 @@ def _build_mxfp4_dualscale(**kw: Any) -> QuantizationConfig:
     return DiffusionMXFP4DualScaleMixedConfig(**kw)
 
 
+def _build_quark_mxfp4(**kw: Any) -> QuantizationConfig:
+    """Lazy import for W4A4 Quark MXFP4 online diffusion config (ROCm gfx950 only)."""
+    from .quark_mxfp4_config import DiffusionQuarkMXFP4Config
+
+    return DiffusionQuarkMXFP4Config(**kw)
+
+
 def _build_inc(**kw: Any) -> QuantizationConfig:
     """Lazy import for INC/AutoRound config with checkpoint kwarg normalization."""
     from .inc_config import OmniINCConfig
@@ -145,6 +152,7 @@ _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "mxfp8": _build_mxfp8,
     "mxfp4": _build_mxfp4,
     "mxfp4_dualscale": _build_mxfp4_dualscale,
+    "quark_mxfp4": _build_quark_mxfp4,
     "inc": _build_inc,
     "auto-round": _build_inc,
     "auto_round": _build_inc,
