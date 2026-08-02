@@ -162,7 +162,9 @@ class DiffusionMXFP4Config(QuantizationConfig):
                 if "gfx950" not in gcn_arch:
                     raise NotImplementedError(f"MXFP4 on ROCm requires gfx950 (MI355X). Detected: {gcn_arch}")
                 if self.is_checkpoint_mxfp4_serialized:
-                    raise NotImplementedError("Pre-quantized MXFP4 checkpoints are not yet supported on ROCm.")
+                    # Route A: calibrated (Quark SmoothQuant+MXFP4) bf16 checkpoint;
+                    # packed to AITER FP4 at load. Same GEMM as online, calibrated weights.
+                    return ROCmMxfp4OfflineLinearMethod(self)
                 return ROCmMxfp4OnlineLinearMethod(self)
             raise NotImplementedError(
                 "DiffusionMXFP4Config (W4A4 MXFP4) is currently only supported "
@@ -486,6 +488,61 @@ class ROCmMxfp4OnlineLinearMethod(_LazyWeightMixin, ROCmMxfp4LinearMethod):
 
         # Delegate to the base class which does AITER quant + shuffle.
         ROCmMxfp4LinearMethod.process_weights_after_loading(self, layer)
+
+
+# ---------------------------------------------------------------------------
+# ROCm MXFP4 offline method (pre-quantized/calibrated checkpoint, Route A)
+# ---------------------------------------------------------------------------
+
+
+class ROCmMxfp4OfflineLinearMethod(ROCmMxfp4LinearMethod):
+    """ROCm W4A4 MXFP4 offline linear method for a Quark-calibrated checkpoint.
+
+    Route A: the checkpoint stores CALIBRATED float (bf16) weights that already hold
+    MXFP4-rounded values (produced offline by Quark: SmoothQuant + MXFP4). At load we
+    pack them to the AITER FP4 layout with the SAME transform the online path uses
+    (per_1x32 + shuffle) - identical GEMM, just calibrated weights.
+
+    Difference from the online method: the weight arrives from a real serialized
+    checkpoint (a normal loadable bf16 param), NOT from meta-device dummy init. So we
+    register a standard weight in create_weights and reuse the base pack in
+    process_weights_after_loading.
+    """
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
+
+        # Calibrated bf16 weight (N, K) - a standard loadable param. The FP4 packing
+        # happens at process_weights_after_loading via the base AITER transform.
+        layer.register_parameter(
+            "weight",
+            ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition, input_size_per_partition, dtype=params_dtype
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            ),
+        )
+
+    # process_weights_after_loading inherited from ROCmMxfp4LinearMethod:
+    # aiter per_1x32 quant + shuffle_weight(16,16) on the loaded calibrated weight.
 
 
 # ---------------------------------------------------------------------------
