@@ -161,7 +161,7 @@ def quantize_component(args, comp: str) -> dict:
 
     del pipe, tf, tq
     gc.collect()
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
     return {"saved": out, "tensors": len(sd), "dropped": dropped, "seconds": round(dt, 1)}
 
 
