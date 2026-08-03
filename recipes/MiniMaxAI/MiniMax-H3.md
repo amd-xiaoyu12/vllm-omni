@@ -118,20 +118,52 @@ then `VLLM_OMNI_TARGET_DEVICE=rocm pip install -e . --no-build-isolation`.
 
 Requests are unchanged (see the HTTP API examples below). Model-level CPU offload
 keeps the Qwen3-VL encoder and DiT from being co-resident, matching the CUDA
-single-GPU path. Sequence/VAE parallelism and `--text-encoder-tp-size` were not
-validated on ROCm; use the single-GPU configuration.
+single-GPU path.
+
+#### Multiple GPUs on ROCm
+
+Multi-GPU serving works on ROCm with Ulysses sequence parallelism and native
+tiled VAE patch parallelism (RCCL distributed collectives). Mirror the CUDA
+four-GPU command with the same two ROCm changes (`HIP_VISIBLE_DEVICES` and
+`TORCH_SDPA`), and drop the CUDA-only `FLASHINFER_DISABLE_VERSION_CHECK`. No CPU
+offload is needed when the model shards across the GPUs.
+
+```bash
+export MODEL="${MODEL_ROOT}/FL2VA"
+export PORT=8091
+
+HIP_VISIBLE_DEVICES=0,1,2,3 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
+vllm serve "${MODEL}" \
+  --omni \
+  --host 0.0.0.0 \
+  --port "${PORT}" \
+  --trust-remote-code \
+  --num-gpus 4 \
+  --usp 4 \
+  --ring 1 \
+  --vae-patch-parallel-size 4 \
+  --vae-parallel-mode tile \
+  --vae-use-tiling \
+  --diffusion-attention-backend TORCH_SDPA
+```
+
+As on CUDA, H3 is CFG-distilled, so keep `--cfg-parallel-size` at 1, and the H3
+VAE supports only its native `tile` mode. `--text-encoder-tp-size` was not
+validated on ROCm.
 
 #### Validated ROCm evidence
 
-Measured on one AMD gfx950 GPU, single-GPU CPU-offload config above, vLLM
-`0.26.0+rocm723` (HIP 7.2), BF16, `TORCH_SDPA`.
+Measured on AMD gfx950 GPUs, vLLM `0.26.0+rocm723` (HIP 7.2), BF16, `TORCH_SDPA`.
 
 | Workload | Configuration | Observed result |
 |----------|---------------|-----------------|
-| T2VA, 480p (832x480), ~4 s, 40 steps | 1x gfx950, CPU offload, TORCH_SDPA | valid MP4 (H.264 + synced audio); ~1.4 s/denoise-step steady state after the warmup/compile step |
+| T2VA, 480p (832x480), ~4 s, 40 steps | 1x gfx950, CPU offload | valid MP4 (H.264 + synced audio); ~1.4 s/denoise-step steady state after warmup |
+| T2VA, 480p (832x480), ~4 s, 40 steps | 4x gfx950, USP 4, VPP 4 tile, no offload | valid MP4; ~0.47 s/denoise-step steady state (~2.1 it/s), ~58 s end-to-end incl. warmup/compile |
 
-This is a functional-correctness validation of the ROCm BF16 path, not a tuned
-throughput number; the first request includes lazy regional compilation.
+These are functional-correctness validations of the ROCm BF16 path, not tuned
+throughput numbers; the first request includes lazy regional compilation.
 
 ### Four GPUs: measured best-practice throughput
 
