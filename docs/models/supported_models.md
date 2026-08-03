@@ -44,7 +44,7 @@ th {
 | `LTX2Pipeline` | LTX-2 / LTX-2.3 one-stage T2V and I2V | `Lightricks/LTX-2`, `diffusers/LTX-2.3-Diffusers` | ✅︎ | ✅︎ | | |
 | `LTX2DistilledPipeline` | LTX-2 distilled two-stage T2V and I2V | `rootonchair/LTX-2-19b-distilled` | ✅︎ | ✅︎ | | |
 | `LingBotVideoPipeline` | LingBot-Video dense and MoE T2V | `robbyant/lingbot-video-dense-1.3b`, `robbyant/lingbot-video-moe-30b-a3b` | ✅︎ | | | |
-| `MiniMaxH3Pipeline` | MiniMax H3 T2VA, FL2VA, and Ref2VA | `MiniMaxAI/MiniMax-H3` | ✅︎ | | | |
+| `MiniMaxH3Pipeline` | MiniMax H3 T2VA, FL2VA, and Ref2VA | `MiniMaxAI/MiniMax-H3` | ✅︎ | ✅︎<sup>H3</sup> | | |
 | `DreamZeroPipeline` | DreamZero-DROID | `GEAR-Dreams/DreamZero-DROID` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `HeliosPipeline`, `HeliosPyramidPipeline` | Helios | `BestWishYsh/Helios-Base`, `BestWishYsh/Helios-Mid`, `BestWishYsh/Helios-Distilled` | ✅︎ | ✅︎ | ✅︎ | |
 | `MagiHumanPipeline` | MagiHuman | `SII-GAIR/daVinci-MagiHuman-Base-1080p` | ✅︎ | ✅︎ | | |
@@ -97,3 +97,9 @@ th {
 |`HiDreamImagePipeline` | HiDream-I1-Full | `HiDream-ai/HiDream-I1-Full` | ✅︎ | ✅︎ | | |
 
 ✅︎ indicates the model is supported on that backend. Empty cells mean not listed as supported on that backend.
+
+<sup>H3</sup> MiniMax H3 AMD GPU support is validated on gfx942 (MI300X, AITER
+`FLASH_ATTN`) and gfx950 (MI350, `TORCH_SDPA`) in BF16. Other AMD SKUs (e.g.
+MI325X) are not listed until their own validation evidence is added. See the
+[MiniMax H3 recipe](../../recipes/MiniMaxAI/MiniMax-H3.md) for per-architecture
+serving commands.

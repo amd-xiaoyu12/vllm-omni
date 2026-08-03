@@ -42,8 +42,9 @@ source .venv/bin/activate
 uv pip install -e '.[fa4]'
 ```
 
-On AMD ROCm (gfx950), install without the `[fa4]` extra and serve through the
-SDPA backend instead; see [AMD ROCm (gfx950): single GPU, BF16](#amd-rocm-gfx950-single-gpu-bf16).
+On AMD ROCm, install without the `[fa4]` extra (FA4 is CUDA-only); see
+[AMD ROCm (gfx942 / gfx950)](#amd-rocm-gfx942--gfx950). The attention backend
+differs by architecture (AITER `FLASH_ATTN` on gfx942, `TORCH_SDPA` on gfx950).
 
 `ffmpeg` and `ffprobe` must be available on `PATH`. They are used for
 reference-video preparation and MP4 output.
@@ -80,53 +81,43 @@ Use a GPU with enough memory for the active H3 component and enough system RAM
 for the offloaded components. CPU offload reduces GPU memory pressure but adds
 PCIe/NVLink transfer latency.
 
-### AMD ROCm (gfx950): single GPU, BF16
+### AMD ROCm (gfx942 / gfx950)
 
-MiniMax H3 runs on AMD Instinct gfx950 (MI350-series) in BF16. The optimized
-FlashAttention-4 / FlashInfer path is CUDA-only, but the H3 transformer ships an
-SDPA fallback (`_sdpa_varlen_attention`), so ROCm serves through the portable
-`TORCH_SDPA` diffusion attention backend. The VAE uses AITER GroupNorm on ROCm.
+MiniMax H3 runs on AMD Instinct GPUs in BF16. The attention backend depends on the
+architecture:
 
-Two changes relative to the CUDA single-GPU command above:
+- **gfx942 (MI300X)**: `--diffusion-attention-backend FLASH_ATTN` resolves to
+  AITER packed varlen attention and is functional. This is the preferred backend
+  on gfx942 and matches the CUDA four-GPU configuration flag-for-flag (with
+  `HIP_VISIBLE_DEVICES` and without the CUDA-only `FLASHINFER_DISABLE_VERSION_CHECK`).
+- **gfx950 (MI350-series)**: use `--diffusion-attention-backend TORCH_SDPA`. The
+  optimized FA4/FlashInfer path is CUDA-only; the H3 transformer's SDPA fallback
+  (`_sdpa_varlen_attention`) provides the correctness path here.
 
-- select the device with `HIP_VISIBLE_DEVICES` (not `CUDA_VISIBLE_DEVICES`);
-- set `--diffusion-attention-backend TORCH_SDPA` (FlashAttention/FlashInfer are
-  unavailable on ROCm and fall back automatically, but selecting SDPA explicitly
-  avoids the fallback warnings).
+In all cases select the device with `HIP_VISIBLE_DEVICES` (not
+`CUDA_VISIBLE_DEVICES`), drop the CUDA-only `FLASHINFER_DISABLE_VERSION_CHECK`, and
+install without the `[fa4]` extra (FA4 is CUDA-only). The VAE uses AITER GroupNorm
+on ROCm.
+
+Install (ROCm wheel + source vLLM-Omni):
 
 ```bash
-export MODEL="${MODEL_ROOT}/FL2VA"
-export PORT=8091
-
-HIP_VISIBLE_DEVICES=0 \
-VLLM_WORKER_MULTIPROC_METHOD=spawn \
-VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
-vllm serve "${MODEL}" \
-  --omni \
-  --host 0.0.0.0 \
-  --port "${PORT}" \
-  --trust-remote-code \
-  --num-gpus 1 \
-  --enable-cpu-offload \
-  --diffusion-attention-backend TORCH_SDPA
+pip install "vllm==0.26.0+rocm723" \
+  --extra-index-url https://wheels.vllm.ai/rocm/0.26.0/rocm723
+VLLM_OMNI_TARGET_DEVICE=rocm pip install -e . --no-build-isolation
 ```
 
-Install notes for ROCm: install the ROCm vLLM wheel and vLLM-Omni without the
-`[fa4]` extra (FA4 is CUDA-only), e.g.
-`pip install "vllm==0.26.0+rocm723" --extra-index-url https://wheels.vllm.ai/rocm/0.26.0/rocm723`
-then `VLLM_OMNI_TARGET_DEVICE=rocm pip install -e . --no-build-isolation`.
+Prebuilt image: `vllm/vllm-omni-rocm:minimax-h3`. Note that image is built from a
+pre-merge commit, so T2VA and FL2VA work, but **image+audio Ref2VA lacks the
+soundfile fallback** (fails without TorchCodec) and **video-reference Ref2VA needs
+`ffmpeg`**, which is not bundled. Build `docker/Dockerfile.rocm` from `v0.26.0` (or
+newer) for the complete Ref2VA paths.
 
-Requests are unchanged (see the HTTP API examples below). Model-level CPU offload
-keeps the Qwen3-VL encoder and DiT from being co-resident, matching the CUDA
-single-GPU path.
+#### Four GPUs (gfx942): AITER FLASH_ATTN
 
-#### Multiple GPUs on ROCm
-
-Multi-GPU serving works on ROCm with Ulysses sequence parallelism and native
-tiled VAE patch parallelism (RCCL distributed collectives). Mirror the CUDA
-four-GPU command with the same two ROCm changes (`HIP_VISIBLE_DEVICES` and
-`TORCH_SDPA`), and drop the CUDA-only `FLASHINFER_DISABLE_VERSION_CHECK`. No CPU
-offload is needed when the model shards across the GPUs.
+The best-practice CUDA four-GPU configuration works on gfx942 with the ROCm changes
+above. This mirrors the CUDA command including Ulysses sequence parallelism, VAE
+patch parallelism, and text-encoder tensor parallelism:
 
 ```bash
 export MODEL="${MODEL_ROOT}/FL2VA"
@@ -143,27 +134,57 @@ vllm serve "${MODEL}" \
   --num-gpus 4 \
   --usp 4 \
   --ring 1 \
+  --text-encoder-tp-size 4 \
   --vae-patch-parallel-size 4 \
   --vae-parallel-mode tile \
   --vae-use-tiling \
+  --diffusion-attention-backend FLASH_ATTN
+```
+
+#### Single / multi GPU (gfx950): TORCH_SDPA
+
+On gfx950 use `TORCH_SDPA`. Single GPU with model-level CPU offload keeps the
+Qwen3-VL encoder and DiT from being co-resident:
+
+```bash
+export MODEL="${MODEL_ROOT}/FL2VA"
+export PORT=8091
+
+HIP_VISIBLE_DEVICES=0 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
+vllm serve "${MODEL}" \
+  --omni --host 0.0.0.0 --port "${PORT}" --trust-remote-code \
+  --num-gpus 1 --enable-cpu-offload \
   --diffusion-attention-backend TORCH_SDPA
 ```
 
-As on CUDA, H3 is CFG-distilled, so keep `--cfg-parallel-size` at 1, and the H3
-VAE supports only its native `tile` mode. `--text-encoder-tp-size` was not
-validated on ROCm.
+Multi-GPU on gfx950 uses Ulysses sequence parallelism and tiled VAE patch
+parallelism (RCCL), no offload; replace the single-GPU tail with
+`--num-gpus 4 --usp 4 --ring 1 --vae-patch-parallel-size 4 --vae-parallel-mode tile
+--vae-use-tiling --diffusion-attention-backend TORCH_SDPA`.
+
+As on CUDA, H3 is CFG-distilled, so keep `--cfg-parallel-size` at 1, and the H3 VAE
+supports only its native `tile` mode.
 
 #### Validated ROCm evidence
 
-Measured on AMD gfx950 GPUs, vLLM `0.26.0+rocm723` (HIP 7.2), BF16, `TORCH_SDPA`.
+vLLM-Omni with MiniMax H3 support, BF16. gfx942 rows measured with the
+`vllm/vllm-omni-rocm:minimax-h3` image; gfx950 rows measured with the
+`0.26.0+rocm723` wheel (HIP 7.2).
 
 | Workload | Configuration | Observed result |
 |----------|---------------|-----------------|
-| T2VA, 480p (832x480), ~4 s, 40 steps | 1x gfx950, CPU offload | valid MP4 (H.264 + synced audio); ~1.4 s/denoise-step steady state after warmup |
-| T2VA, 480p (832x480), ~4 s, 40 steps | 4x gfx950, USP 4, VPP 4 tile, no offload | valid MP4; ~0.47 s/denoise-step steady state (~2.1 it/s), ~58 s end-to-end incl. warmup/compile |
+| T2VA, 1344x768, 209 frames, 50 steps | 4x gfx942 (MI300X), FLASH_ATTN, USP4, text-enc TP4, VAE PP4 tile | encode 0.09 s, denoise 244.04 s, decode 4.15 s, 267.42 s client E2E; H.264 24 FPS + 32 kHz stereo AAC |
+| FL2VA, 1344x768, 209 frames, 50 steps | 4x gfx942 (MI300X), FLASH_ATTN, USP4, text-enc TP4, VAE PP4 tile | encode 13.98 s, denoise 257.58 s, decode 4.11 s, 287.07 s client E2E; H.264 24 FPS + 32 kHz stereo AAC |
+| T2VA, 832x480, ~4 s, 40 steps | 1x gfx950 (MI350), TORCH_SDPA, CPU offload | valid MP4 (H.264 + synced audio); ~1.4 s/denoise-step steady state after warmup |
+| T2VA, 832x480, ~4 s, 40 steps | 4x gfx950 (MI350), TORCH_SDPA, USP4, VAE PP4 tile, no offload | valid MP4; ~0.47 s/denoise-step steady state (~2.1 it/s), ~58 s client E2E incl. warmup/compile |
 
-These are functional-correctness validations of the ROCm BF16 path, not tuned
-throughput numbers; the first request includes lazy regional compilation.
+gfx942 figures are the mean of three requests after one excluded warmup
+(external evidence: vllm-project/recipes#732). gfx950 figures are
+functional-correctness validations, not tuned throughput; the first request
+includes lazy regional compilation. MI325X (gfx942) and other MI355X SKUs are not
+listed until their own evidence is added.
 
 ### Four GPUs: measured best-practice throughput
 
