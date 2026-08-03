@@ -42,6 +42,9 @@ source .venv/bin/activate
 uv pip install -e '.[fa4]'
 ```
 
+On AMD ROCm (gfx950), install without the `[fa4]` extra and serve through the
+SDPA backend instead; see [AMD ROCm (gfx950): single GPU, BF16](#amd-rocm-gfx950-single-gpu-bf16).
+
 `ffmpeg` and `ffprobe` must be available on `PATH`. They are used for
 reference-video preparation and MP4 output.
 
@@ -76,6 +79,59 @@ vllm serve "${MODEL}" \
 Use a GPU with enough memory for the active H3 component and enough system RAM
 for the offloaded components. CPU offload reduces GPU memory pressure but adds
 PCIe/NVLink transfer latency.
+
+### AMD ROCm (gfx950): single GPU, BF16
+
+MiniMax H3 runs on AMD Instinct gfx950 (MI350-series) in BF16. The optimized
+FlashAttention-4 / FlashInfer path is CUDA-only, but the H3 transformer ships an
+SDPA fallback (`_sdpa_varlen_attention`), so ROCm serves through the portable
+`TORCH_SDPA` diffusion attention backend. The VAE uses AITER GroupNorm on ROCm.
+
+Two changes relative to the CUDA single-GPU command above:
+
+- select the device with `HIP_VISIBLE_DEVICES` (not `CUDA_VISIBLE_DEVICES`);
+- set `--diffusion-attention-backend TORCH_SDPA` (FlashAttention/FlashInfer are
+  unavailable on ROCm and fall back automatically, but selecting SDPA explicitly
+  avoids the fallback warnings).
+
+```bash
+export MODEL="${MODEL_ROOT}/FL2VA"
+export PORT=8091
+
+HIP_VISIBLE_DEVICES=0 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+VLLM_OMNI_VIDEO_SYNC_TIMEOUT=1800 \
+vllm serve "${MODEL}" \
+  --omni \
+  --host 0.0.0.0 \
+  --port "${PORT}" \
+  --trust-remote-code \
+  --num-gpus 1 \
+  --enable-cpu-offload \
+  --diffusion-attention-backend TORCH_SDPA
+```
+
+Install notes for ROCm: install the ROCm vLLM wheel and vLLM-Omni without the
+`[fa4]` extra (FA4 is CUDA-only), e.g.
+`pip install "vllm==0.26.0+rocm723" --extra-index-url https://wheels.vllm.ai/rocm/0.26.0/rocm723`
+then `VLLM_OMNI_TARGET_DEVICE=rocm pip install -e . --no-build-isolation`.
+
+Requests are unchanged (see the HTTP API examples below). Model-level CPU offload
+keeps the Qwen3-VL encoder and DiT from being co-resident, matching the CUDA
+single-GPU path. Sequence/VAE parallelism and `--text-encoder-tp-size` were not
+validated on ROCm; use the single-GPU configuration.
+
+#### Validated ROCm evidence
+
+Measured on one AMD gfx950 GPU, single-GPU CPU-offload config above, vLLM
+`0.26.0+rocm723` (HIP 7.2), BF16, `TORCH_SDPA`.
+
+| Workload | Configuration | Observed result |
+|----------|---------------|-----------------|
+| T2VA, 480p (832x480), ~4 s, 40 steps | 1x gfx950, CPU offload, TORCH_SDPA | valid MP4 (H.264 + synced audio); ~1.4 s/denoise-step steady state after the warmup/compile step |
+
+This is a functional-correctness validation of the ROCm BF16 path, not a tuned
+throughput number; the first request includes lazy regional compilation.
 
 ### Four GPUs: measured best-practice throughput
 
