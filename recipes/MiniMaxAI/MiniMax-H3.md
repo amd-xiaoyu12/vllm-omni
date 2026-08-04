@@ -463,11 +463,13 @@ reduction.
 - The 768 px short-edge mode is available for T2VA and FL2VA; 1344x768 is the
   documented 16:9 request shape.
 - `--cfg-parallel-size > 1` is rejected by design (CFG-distilled, no negative branch).
-- The VAE supports the native `tile` parallel mode only.
+- VAE patch parallelism requires size 1 or the full DiT group size and supports the
+  H3 native `tile` mode only.
 - A U2 x Ring2 hybrid currently fails with an attention-mask length mismatch; use
   pure Ulysses.
-- FP8 quantization is not supported yet - a transformer-side blocker is known and
-  deferred past the day-0 release.
+- Online FP8 is not compatible with layerwise offload (the offload path produces a
+  weight stride rejected by the Cutlass FP8 kernel); use resident FP8 with tensor
+  parallelism instead. See [Online FP8 quantization](#online-fp8-quantization).
 - Pure Ulysses still replicates the full DiT on every rank, so smaller-memory GPUs
   cannot use `--usp N --tp 1` as a resident capacity path. Use DiT tensor parallelism
   or model-level CPU offload; text-encoder TP alone is not sufficient.
