@@ -467,9 +467,7 @@ reduction.
   H3 native `tile` mode only.
 - A U2 x Ring2 hybrid currently fails with an attention-mask length mismatch; use
   pure Ulysses.
-- Online FP8 is not compatible with layerwise offload (the offload path produces a
-  weight stride rejected by the Cutlass FP8 kernel); use resident FP8 with tensor
-  parallelism instead. See [Online FP8 quantization](#online-fp8-quantization).
+- Online FP8 is not compatible with layerwise offload.
 - Pure Ulysses still replicates the full DiT on every rank, so smaller-memory GPUs
   cannot use `--usp N --tp 1` as a resident capacity path. Use DiT tensor parallelism
   or model-level CPU offload; text-encoder TP alone is not sufficient.
