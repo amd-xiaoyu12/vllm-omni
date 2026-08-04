@@ -99,11 +99,10 @@ pip install "vllm==0.26.0+rocm723" \
 VLLM_OMNI_TARGET_DEVICE=rocm pip install -e . --no-build-isolation
 ```
 
-Prebuilt image: `vllm/vllm-omni-rocm:minimax-h3`. Note that image is built from a
-pre-merge commit, so T2VA and FL2VA work, but **image+audio Ref2VA lacks the
-soundfile fallback** (fails without TorchCodec) and **video-reference Ref2VA needs
-`ffmpeg`**, which is not bundled. Build `docker/Dockerfile.rocm` from `v0.26.0` (or
-newer) for the complete Ref2VA paths.
+Prebuilt image: `vllm/vllm-omni-rocm:minimax-h3`. T2VA, FL2VA, and image+audio
+Ref2VA work (the image bundles TorchCodec). **Video-reference Ref2VA needs
+`ffmpeg`**, which is not bundled; build `docker/Dockerfile.rocm` from `v0.26.0` (or
+newer) for that path.
 
 #### Single GPU
 
