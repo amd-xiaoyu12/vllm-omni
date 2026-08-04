@@ -451,16 +451,26 @@ reduction.
 
 ## Known limitations
 
-- Each server process loads only one checkpoint partition.
-- H3 currently executes one generation request per diffusion batch.
+- Each server process loads exactly one checkpoint partition.
+- H3 executes one generation request per diffusion batch today.
 - The first regional-compile request is a warmup and should not be included in
   steady-state performance measurements.
-- Online FP8 is not compatible with layerwise offload.
-- Image+audio Ref2VA accepts exactly one image and one audio reference.
-- Video Ref2VA accepts one or more video files, but not an additional standalone
-  audio reference.
-- VAE patch parallelism requires size 1 or the full DiT group size and supports
-  the H3 native `tile` mode only.
+- The serving path accepts fewer references than the model supports. H3 documents up
+  to 9 images, 3 video clips, and 3 audio clips (12 files) per Omni Reference
+  request; the current vLLM-Omni path takes exactly one image plus one audio
+  reference, or one or more videos with no separate `audio_reference` (it uses the
+  source soundtracks).
+- The 768 px short-edge mode is available for T2VA and FL2VA; 1344x768 is the
+  documented 16:9 request shape.
+- `--cfg-parallel-size > 1` is rejected by design (CFG-distilled, no negative branch).
+- The VAE supports the native `tile` parallel mode only.
+- A U2 x Ring2 hybrid currently fails with an attention-mask length mismatch; use
+  pure Ulysses.
+- FP8 quantization is not supported yet - a transformer-side blocker is known and
+  deferred past the day-0 release.
+- Pure Ulysses still replicates the full DiT on every rank, so smaller-memory GPUs
+  cannot use `--usp N --tp 1` as a resident capacity path. Use DiT tensor parallelism
+  or model-level CPU offload; text-encoder TP alone is not sufficient.
 
 ## Additional resources
 
