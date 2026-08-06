@@ -10,15 +10,6 @@ loader (ROCmMxfp4OfflineLinearMethod, gfx950) reads it, packs to the AITER FP4
 layout at load, and runs the same gemm_a4w4 as the online path - only the weights
 are calibrated.
 
-Why "Route A" (float weights, not packed FP4 on disk): Quark's export_safetensors
-packing path is Transformers-only; for a bare DiT we keep the frozen bf16 weights
-(which already hold the calibrated FP4-rounded values) and let the loader pack at
-load. This delivers the calibration accuracy the uncalibrated online path cannot.
-
-Rotation (R1/R2) is intentionally OFF: Quark's RotationProcessor needs a decoder-
-shaped scaling dict that does not map cleanly onto Wan's DiT (follow-up). SmoothQuant
-uses the per-model scaling map in quark_mxfp4_scaling_maps.py.
-
 The A14B cascade has TWO transformers (transformer + transformer_2); both are
 quantized with the same config.
 
