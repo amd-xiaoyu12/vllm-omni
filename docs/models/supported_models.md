@@ -102,5 +102,5 @@ th {
 gfx950 (MI350) in BF16, using the AITER `FLASH_ATTN` diffusion attention backend.
 Other AMD SKUs (e.g. MI325X) are not listed until their
 own validation evidence is added. See the
-[MiniMax H3 recipe](../../recipes/MiniMaxAI/MiniMax-H3.md) for per-architecture
-serving commands.
+[MiniMax H3 recipe](https://recipes.vllm.ai/MiniMaxAI/MiniMax-H3) for
+per-architecture serving commands.
