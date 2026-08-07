@@ -39,6 +39,21 @@ WAN_MAP_I2V_EXTRA = [
     {"prev_op": "norm2", "layers": ["attn2.add_k_proj", "attn2.add_v_proj"], "inp": "attn2.add_k_proj"},
 ]
 
+# R2 rotation (offline, folds into v_proj/o_proj within each block; no runtime op).
+# RotationProcessor.get_scaling_layers requires scaling_layers as a dict keyed
+# first_layer/middle_layers/last_layer even for R2-only. With r1=False the entries
+# only need target_modules (the prev/norm/next requirements are R1-only). The actual
+# R2 fold uses the v_proj/o_proj fields below, rotating attention head_dim channels.
+_WAN_R2_TARGETS = [{"target_modules": ["blocks.layer_id.attn1.to_v",
+                                       "blocks.layer_id.attn1.to_out.0"]}]
+WAN_R2_ROTATION = {
+    "scaling_layers": {"first_layer": _WAN_R2_TARGETS,
+                       "middle_layers": _WAN_R2_TARGETS,
+                       "last_layer": _WAN_R2_TARGETS},
+    "v_proj": "attn1.to_v", "o_proj": "attn1.to_out.0",
+    "self_attn": "attn1", "mlp": "ffn",
+}
+
 # Flux - PLACEHOLDER, filled in during the Flux pass. Two block types (dual-stream
 # + single-stream) plus a context branch (add_kv_proj / to_add_out) Wan lacks.
 FLUX_MAP: list = []  # TODO(flux)
@@ -46,6 +61,22 @@ FLUX_MAP: list = []  # TODO(flux)
 SCALING_MAPS = {
     "WanTransformer3DModel": WAN_MAP,
     "FluxTransformer2DModel": FLUX_MAP,   # placeholder
+}
+
+# Structural linears that must stay bf16 (embedders / final projection). These are
+# not wrapped as quantizable linears in the vllm-omni model, so quantizing them
+# produces packed keys the loader cannot place. Passed to QConfig.exclude and to the
+# checkpoint's ignored_layers.
+EXCLUDE_MAPS = {
+    "WanTransformer3DModel": [
+        "*time_embedder*", "*time_proj*", "*text_embedder*",
+        "*condition_embedder*", "*patch_embedding*", "*norm_out*", "*proj_out*",
+    ],
+}
+
+# R2 rotation configs (dict-form scaling_layers + v/o proj fields), per model.
+ROTATION_MAPS = {
+    "WanTransformer3DModel": WAN_R2_ROTATION,
 }
 
 # Attribute path to the ModuleList of transformer blocks. Quark's processors need
@@ -63,6 +94,38 @@ def get_decoder_layers_attr(model) -> str:
             f"No decoder-layers attr for {name!r}. Add it to DECODER_LAYERS_ATTR."
         )
     return DECODER_LAYERS_ATTR[name]
+
+
+def get_exclude_patterns(model) -> list:
+    """Structural linears (embedders/proj_out) that must stay bf16, or [] if none."""
+    return list(EXCLUDE_MAPS.get(type(model).__name__, []))
+
+
+def get_rotation_map(model) -> dict:
+    """Return the R2 rotation config for a diffusion transformer instance."""
+    name = type(model).__name__
+    if name not in ROTATION_MAPS:
+        raise NotImplementedError(
+            f"No Quark R2 rotation map for {name!r}. Add an entry to ROTATION_MAPS. "
+            f"Known: {list(ROTATION_MAPS)}"
+        )
+    return ROTATION_MAPS[name]
+
+
+def shim_rotation_config(cfg) -> None:
+    """Add the config attrs Quark's rotation processor reads (diffusers DiT configs
+    lack the HF-LLM names). R2 needs head_dim + num_hidden_layers; hidden_size is a
+    fallback for head_dim."""
+    for name, value in (
+        ("head_dim", getattr(cfg, "attention_head_dim", None)),
+        ("num_hidden_layers", getattr(cfg, "num_layers", None)),
+        ("hidden_size", (getattr(cfg, "num_attention_heads", 0) or 0)
+                        * (getattr(cfg, "attention_head_dim", 0) or 0)),
+    ):
+        if getattr(cfg, name, None) is None and value:
+            setattr(cfg, name, value)
+    if getattr(cfg, "intermediate_size", None) is None and getattr(cfg, "ffn_dim", None):
+        cfg.intermediate_size = cfg.ffn_dim
 
 
 def get_scaling_map(model, i2v: bool = False) -> list:

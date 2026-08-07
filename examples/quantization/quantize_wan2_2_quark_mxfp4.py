@@ -35,7 +35,13 @@ import time
 
 import torch
 
-from quark_mxfp4_scaling_maps import get_decoder_layers_attr, get_scaling_map
+from quark_mxfp4_scaling_maps import (
+    get_decoder_layers_attr,
+    get_exclude_patterns,
+    get_rotation_map,
+    get_scaling_map,
+    shim_rotation_config,
+)
 
 DEFAULT_CALIB_PROMPTS = [
     "A serene lakeside sunrise with mist over the water.",
@@ -88,7 +94,7 @@ class _SafeCalibLoader:
                 yield sample
 
 
-def build_qconfig(model, alpha: float, smooth: bool, r1: bool, r2: bool):
+def build_qconfig(model, alpha: float, smooth: bool, r2: bool):
     from quark.torch.quantization.config.config import (
         QConfig, QLayerConfig, OCP_MXFP4Spec, RotationConfig, SmoothQuantConfig,
     )
@@ -98,19 +104,26 @@ def build_qconfig(model, alpha: float, smooth: bool, r1: bool, r2: bool):
 
     w_spec = OCP_MXFP4Spec(ch_axis=-1, is_dynamic=False).to_quantization_spec()
     global_cfg = QLayerConfig(weight=w_spec)
+    exclude = get_exclude_patterns(model)
 
     algo = []
-    if r1 or r2:
-        # Fused Hadamard (online_r1_rotation OFF -> folds into weights, no forward op).
+    if r2:
+        # R2 folds into v_proj/o_proj weights offline (no runtime op). Uses the
+        # dict-form rotation map; R1 is excluded (Wan R1 requires an online rotation
+        # op the inference path does not have).
+        rot = get_rotation_map(model)
+        shim_rotation_config(model.config)
         algo.append(RotationConfig(
-            scaling_layers=scaling_layers, model_decoder_layers=decoder_layers,
-            r1=r1, r2=r2, r3=False, r4=False, online_r1_rotation=False,
+            scaling_layers=rot["scaling_layers"], model_decoder_layers=decoder_layers,
+            r1=False, r2=True, r3=False, r4=False,
+            v_proj=rot["v_proj"], o_proj=rot["o_proj"],
+            self_attn=rot["self_attn"], mlp=rot["mlp"],
         ))
     if smooth:
         algo.append(SmoothQuantConfig(
             scaling_layers=scaling_layers, model_decoder_layers=decoder_layers, alpha=alpha,
         ))
-    return QConfig(global_quant_config=global_cfg, algo_config=algo or None)
+    return QConfig(global_quant_config=global_cfg, algo_config=algo or None, exclude=exclude)
 
 
 def _pack_linear_weight(w_bf16: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -151,7 +164,7 @@ def quantize_component(args, comp: str) -> dict:
     tf = getattr(pipe, comp)
     print(f"[quark-mxfp4] {comp}: {type(tf).__name__} loaded in {time.time() - t0:.0f}s")
 
-    qconfig = build_qconfig(tf, args.alpha, not args.no_smooth, args.r1, args.r2)
+    qconfig = build_qconfig(tf, args.alpha, not args.no_smooth, args.r2)
     pipe.to(dev)
     prompts = DEFAULT_CALIB_PROMPTS[:args.n_prompts]
     dl = _SafeCalibLoader(get_calib_dataloader(pipe, tf, prompts, n_steps=args.n_steps, device=dev))
@@ -207,7 +220,7 @@ def quantize_component(args, comp: str) -> dict:
         "quant_method": "quark", "quark_export_format": export_format,
         "is_checkpoint_mxfp4_serialized": True, "producer": "quark",
         "algo": {"smoothquant": not args.no_smooth, "alpha": args.alpha,
-                 "rotation_r1": args.r1, "rotation_r2": args.r2},
+                 "rotation_r2": args.r2},
     }
     if export_format == "mxfp4_packed":
         # Loader must match this preshuffle layout.
@@ -237,8 +250,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-steps", type=int, default=4, help="Denoise steps per calib prompt.")
     p.add_argument("--alpha", type=float, default=0.5, help="SmoothQuant alpha.")
     p.add_argument("--no-smooth", action="store_true", help="Disable SmoothQuant (plain MXFP4).")
-    p.add_argument("--r1", action="store_true", help="Enable fused Hadamard R1 (experimental on DiT).")
-    p.add_argument("--r2", action="store_true", help="Enable fused Hadamard R2 (experimental on DiT).")
+    p.add_argument("--r2", action="store_true",
+                   help="Enable R2 Hadamard rotation (folds into attn v/o proj offline; "
+                        "no runtime op). R1 is not supported on Wan (needs an online "
+                        "rotation op in the inference path).")
     p.add_argument("--pack", action="store_true",
                    help="Pack weights offline to the AITER FP4 layout (weight_shuffle + "
                         "weight_scale, ~3.7x smaller, no pack at load). ROCm gfx950 loader "
@@ -250,7 +265,7 @@ def main() -> None:
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
     summary = {"model": args.model, "output": args.output, "alpha": args.alpha,
-               "smoothquant": not args.no_smooth, "r1": args.r1, "r2": args.r2,
+               "smoothquant": not args.no_smooth, "r2": args.r2,
                "n_prompts": args.n_prompts, "n_steps": args.n_steps, "components": {}}
     for comp in args.components:
         print(f"\n{'=' * 60}\n[quark-mxfp4] component: {comp}\n{'=' * 60}")
