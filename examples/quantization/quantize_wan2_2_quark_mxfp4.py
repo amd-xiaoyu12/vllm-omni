@@ -34,7 +34,6 @@ import os
 import time
 
 import torch
-
 from quark_mxfp4_scaling_maps import (
     get_decoder_layers_attr,
     get_exclude_patterns,
@@ -88,15 +87,18 @@ class _SafeCalibLoader:
     def __iter__(self):
         for sample in self._dl:
             if isinstance(sample, dict):
-                yield {k: (v if isinstance(v, torch.Tensor) else _ToSafe(v))
-                       for k, v in sample.items()}
+                yield {k: (v if isinstance(v, torch.Tensor) else _ToSafe(v)) for k, v in sample.items()}
             else:
                 yield sample
 
 
 def build_qconfig(model, alpha: float, smooth: bool, r2: bool):
     from quark.torch.quantization.config.config import (
-        QConfig, QLayerConfig, OCP_MXFP4Spec, RotationConfig, SmoothQuantConfig,
+        OCP_MXFP4Spec,
+        QConfig,
+        QLayerConfig,
+        RotationConfig,
+        SmoothQuantConfig,
     )
 
     scaling_layers = get_scaling_map(model)
@@ -113,16 +115,28 @@ def build_qconfig(model, alpha: float, smooth: bool, r2: bool):
         # op the inference path does not have).
         rot = get_rotation_map(model)
         shim_rotation_config(model.config)
-        algo.append(RotationConfig(
-            scaling_layers=rot["scaling_layers"], model_decoder_layers=decoder_layers,
-            r1=False, r2=True, r3=False, r4=False,
-            v_proj=rot["v_proj"], o_proj=rot["o_proj"],
-            self_attn=rot["self_attn"], mlp=rot["mlp"],
-        ))
+        algo.append(
+            RotationConfig(
+                scaling_layers=rot["scaling_layers"],
+                model_decoder_layers=decoder_layers,
+                r1=False,
+                r2=True,
+                r3=False,
+                r4=False,
+                v_proj=rot["v_proj"],
+                o_proj=rot["o_proj"],
+                self_attn=rot["self_attn"],
+                mlp=rot["mlp"],
+            )
+        )
     if smooth:
-        algo.append(SmoothQuantConfig(
-            scaling_layers=scaling_layers, model_decoder_layers=decoder_layers, alpha=alpha,
-        ))
+        algo.append(
+            SmoothQuantConfig(
+                scaling_layers=scaling_layers,
+                model_decoder_layers=decoder_layers,
+                alpha=alpha,
+            )
+        )
     return QConfig(global_quant_config=global_cfg, algo_config=algo or None, exclude=exclude)
 
 
@@ -166,7 +180,7 @@ def quantize_component(args, comp: str) -> dict:
 
     qconfig = build_qconfig(tf, args.alpha, not args.no_smooth, args.r2)
     pipe.to(dev)
-    prompts = DEFAULT_CALIB_PROMPTS[:args.n_prompts]
+    prompts = DEFAULT_CALIB_PROMPTS[: args.n_prompts]
     dl = _SafeCalibLoader(get_calib_dataloader(pipe, tf, prompts, n_steps=args.n_steps, device=dev))
 
     quantizer = ModelQuantizer(qconfig)
@@ -197,8 +211,9 @@ def quantize_component(args, comp: str) -> dict:
             else:
                 sd[k] = v.to(torch.bfloat16).contiguous() if v.is_floating_point() else v.contiguous()
         # Non-quantized linears load unquantized (bf16) at runtime.
-        all_linears = {n for n, m in tq.named_modules()
-                       if isinstance(m, torch.nn.Linear) or hasattr(m, "_weight_quantizer")}
+        all_linears = {
+            n for n, m in tq.named_modules() if isinstance(m, torch.nn.Linear) or hasattr(m, "_weight_quantizer")
+        }
         ignored = sorted(all_linears - quantized)
         note = f"packed {packed} linears"
     else:
@@ -217,56 +232,75 @@ def quantize_component(args, comp: str) -> dict:
     save_file(sd, os.path.join(out, "diffusion_pytorch_model.safetensors"))
     # config.json stanza so vllm-omni auto-selects the right offline MXFP4 loader.
     qc = {
-        "quant_method": "quark", "quark_export_format": export_format,
-        "is_checkpoint_mxfp4_serialized": True, "producer": "quark",
-        "algo": {"smoothquant": not args.no_smooth, "alpha": args.alpha,
-                 "rotation_r2": args.r2},
+        "quant_method": "quark",
+        "quark_export_format": export_format,
+        "is_checkpoint_mxfp4_serialized": True,
+        "producer": "quark",
+        "algo": {"smoothquant": not args.no_smooth, "alpha": args.alpha, "rotation_r2": args.r2},
     }
     if export_format == "mxfp4_packed":
         # Loader must match this preshuffle layout.
         qc["packing"] = "aiter_per_1x32_shuffle16x16"
         if ignored:
             qc["ignored_layers"] = ignored
-    json.dump({"quantization_config": qc},
-              open(os.path.join(out, "quant_config.json"), "w"), indent=2)
-    print(f"[quark-mxfp4] {comp}: saved {len(sd)} tensors ({note}, dropped {dropped} "
-          f"quantizer keys) format={export_format} -> {out} in {dt:.0f}s")
+    json.dump({"quantization_config": qc}, open(os.path.join(out, "quant_config.json"), "w"), indent=2)
+    print(
+        f"[quark-mxfp4] {comp}: saved {len(sd)} tensors ({note}, dropped {dropped} "
+        f"quantizer keys) format={export_format} -> {out} in {dt:.0f}s"
+    )
 
     del pipe, tf, tq
     gc.collect()
     torch.accelerator.empty_cache()
-    return {"saved": out, "tensors": len(sd), "dropped": dropped,
-            "format": export_format, "seconds": round(dt, 1)}
+    return {"saved": out, "tensors": len(sd), "dropped": dropped, "format": export_format, "seconds": round(dt, 1)}
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Export a calibrated Quark MXFP4 Wan2.2 checkpoint.")
-    p.add_argument("--model", default="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-                   help="Source BF16 diffusers model path or id.")
+    p.add_argument(
+        "--model", default="Wan-AI/Wan2.2-T2V-A14B-Diffusers", help="Source BF16 diffusers model path or id."
+    )
     p.add_argument("--output", required=True, help="Export root directory.")
-    p.add_argument("--components", nargs="+", default=["transformer", "transformer_2"],
-                   help="Transformer components to quantize (A14B cascade = both).")
+    p.add_argument(
+        "--components",
+        nargs="+",
+        default=["transformer", "transformer_2"],
+        help="Transformer components to quantize (A14B cascade = both).",
+    )
     p.add_argument("--n-prompts", type=int, default=4, help="Calibration prompts.")
     p.add_argument("--n-steps", type=int, default=4, help="Denoise steps per calib prompt.")
     p.add_argument("--alpha", type=float, default=0.5, help="SmoothQuant alpha.")
     p.add_argument("--no-smooth", action="store_true", help="Disable SmoothQuant (plain MXFP4).")
-    p.add_argument("--r2", action="store_true",
-                   help="Enable R2 Hadamard rotation (folds into attn v/o proj offline; "
-                        "no runtime op). R1 is not supported on Wan (needs an online "
-                        "rotation op in the inference path).")
-    p.add_argument("--pack", action="store_true",
-                   help="Pack weights offline to the AITER FP4 layout (weight_shuffle + "
-                        "weight_scale, ~3.7x smaller, no pack at load). ROCm gfx950 loader "
-                        "only. Omit for the portable calibrated-bf16 export.")
+    p.add_argument(
+        "--r2",
+        action="store_true",
+        help="Enable R2 Hadamard rotation (folds into attn v/o proj offline; "
+        "no runtime op). R1 is not supported on Wan (needs an online "
+        "rotation op in the inference path).",
+    )
+    p.add_argument(
+        "--pack",
+        action="store_true",
+        help="Pack weights offline to the AITER FP4 layout (weight_shuffle + "
+        "weight_scale, ~3.7x smaller, no pack at load). ROCm gfx950 loader "
+        "only. Omit for the portable calibrated-bf16 export.",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
-    summary = {"model": args.model, "output": args.output, "alpha": args.alpha,
-               "smoothquant": not args.no_smooth, "r2": args.r2,
-               "n_prompts": args.n_prompts, "n_steps": args.n_steps, "components": {}}
+    summary = {
+        "model": args.model,
+        "output": args.output,
+        "alpha": args.alpha,
+        "smoothquant": not args.no_smooth,
+        "r2": args.r2,
+        "n_prompts": args.n_prompts,
+        "n_steps": args.n_steps,
+        "components": {},
+    }
     for comp in args.components:
         print(f"\n{'=' * 60}\n[quark-mxfp4] component: {comp}\n{'=' * 60}")
         summary["components"][comp] = quantize_component(args, comp)

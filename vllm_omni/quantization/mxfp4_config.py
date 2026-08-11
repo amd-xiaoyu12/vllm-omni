@@ -538,9 +538,7 @@ class ROCmMxfp4OfflineLinearMethod(ROCmMxfp4LinearMethod):
         layer.register_parameter(
             "weight",
             ModelWeightParameter(
-                data=torch.empty(
-                    output_size_per_partition, input_size_per_partition, dtype=params_dtype
-                ),
+                data=torch.empty(output_size_per_partition, input_size_per_partition, dtype=params_dtype),
                 input_dim=1,
                 output_dim=0,
                 weight_loader=weight_loader,
