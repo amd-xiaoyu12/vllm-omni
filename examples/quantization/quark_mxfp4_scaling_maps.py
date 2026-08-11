@@ -44,14 +44,13 @@ WAN_MAP_I2V_EXTRA = [
 # first_layer/middle_layers/last_layer even for R2-only. With r1=False the entries
 # only need target_modules (the prev/norm/next requirements are R1-only). The actual
 # R2 fold uses the v_proj/o_proj fields below, rotating attention head_dim channels.
-_WAN_R2_TARGETS = [{"target_modules": ["blocks.layer_id.attn1.to_v",
-                                       "blocks.layer_id.attn1.to_out.0"]}]
+_WAN_R2_TARGETS = [{"target_modules": ["blocks.layer_id.attn1.to_v", "blocks.layer_id.attn1.to_out.0"]}]
 WAN_R2_ROTATION = {
-    "scaling_layers": {"first_layer": _WAN_R2_TARGETS,
-                       "middle_layers": _WAN_R2_TARGETS,
-                       "last_layer": _WAN_R2_TARGETS},
-    "v_proj": "attn1.to_v", "o_proj": "attn1.to_out.0",
-    "self_attn": "attn1", "mlp": "ffn",
+    "scaling_layers": {"first_layer": _WAN_R2_TARGETS, "middle_layers": _WAN_R2_TARGETS, "last_layer": _WAN_R2_TARGETS},
+    "v_proj": "attn1.to_v",
+    "o_proj": "attn1.to_out.0",
+    "self_attn": "attn1",
+    "mlp": "ffn",
 }
 
 # Flux - PLACEHOLDER, filled in during the Flux pass. Two block types (dual-stream
@@ -60,7 +59,7 @@ FLUX_MAP: list = []  # TODO(flux)
 
 SCALING_MAPS = {
     "WanTransformer3DModel": WAN_MAP,
-    "FluxTransformer2DModel": FLUX_MAP,   # placeholder
+    "FluxTransformer2DModel": FLUX_MAP,  # placeholder
 }
 
 # Structural linears that must stay bf16 (embedders / final projection). These are
@@ -69,8 +68,13 @@ SCALING_MAPS = {
 # checkpoint's ignored_layers.
 EXCLUDE_MAPS = {
     "WanTransformer3DModel": [
-        "*time_embedder*", "*time_proj*", "*text_embedder*",
-        "*condition_embedder*", "*patch_embedding*", "*norm_out*", "*proj_out*",
+        "*time_embedder*",
+        "*time_proj*",
+        "*text_embedder*",
+        "*condition_embedder*",
+        "*patch_embedding*",
+        "*norm_out*",
+        "*proj_out*",
     ],
 }
 
@@ -83,16 +87,14 @@ ROTATION_MAPS = {
 # this (model_decoder_layers); diffusers DiTs are not decoder-style (no model.layers).
 DECODER_LAYERS_ATTR = {
     "WanTransformer3DModel": "blocks",
-    "FluxTransformer2DModel": "transformer_blocks",   # placeholder (verify at Flux pass)
+    "FluxTransformer2DModel": "transformer_blocks",  # placeholder (verify at Flux pass)
 }
 
 
 def get_decoder_layers_attr(model) -> str:
     name = type(model).__name__
     if name not in DECODER_LAYERS_ATTR:
-        raise NotImplementedError(
-            f"No decoder-layers attr for {name!r}. Add it to DECODER_LAYERS_ATTR."
-        )
+        raise NotImplementedError(f"No decoder-layers attr for {name!r}. Add it to DECODER_LAYERS_ATTR.")
     return DECODER_LAYERS_ATTR[name]
 
 
@@ -106,8 +108,7 @@ def get_rotation_map(model) -> dict:
     name = type(model).__name__
     if name not in ROTATION_MAPS:
         raise NotImplementedError(
-            f"No Quark R2 rotation map for {name!r}. Add an entry to ROTATION_MAPS. "
-            f"Known: {list(ROTATION_MAPS)}"
+            f"No Quark R2 rotation map for {name!r}. Add an entry to ROTATION_MAPS. Known: {list(ROTATION_MAPS)}"
         )
     return ROTATION_MAPS[name]
 
@@ -119,8 +120,7 @@ def shim_rotation_config(cfg) -> None:
     for name, value in (
         ("head_dim", getattr(cfg, "attention_head_dim", None)),
         ("num_hidden_layers", getattr(cfg, "num_layers", None)),
-        ("hidden_size", (getattr(cfg, "num_attention_heads", 0) or 0)
-                        * (getattr(cfg, "attention_head_dim", 0) or 0)),
+        ("hidden_size", (getattr(cfg, "num_attention_heads", 0) or 0) * (getattr(cfg, "attention_head_dim", 0) or 0)),
     ):
         if getattr(cfg, name, None) is None and value:
             setattr(cfg, name, value)
@@ -137,14 +137,11 @@ def get_scaling_map(model, i2v: bool = False) -> list:
     name = type(model).__name__
     if name not in SCALING_MAPS:
         raise NotImplementedError(
-            f"No Quark scaling_layers map for {name!r}. Add an entry to SCALING_MAPS. "
-            f"Known: {list(SCALING_MAPS)}"
+            f"No Quark scaling_layers map for {name!r}. Add an entry to SCALING_MAPS. Known: {list(SCALING_MAPS)}"
         )
     m = list(SCALING_MAPS[name])
     if name == "WanTransformer3DModel" and i2v:
         m = m + WAN_MAP_I2V_EXTRA
     if not m:
-        raise NotImplementedError(
-            f"Scaling map for {name!r} is a placeholder (empty). Fill it before exporting."
-        )
+        raise NotImplementedError(f"Scaling map for {name!r} is a placeholder (empty). Fill it before exporting.")
     return m
