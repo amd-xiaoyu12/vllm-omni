@@ -435,3 +435,96 @@ def test_svdquant_packed_matches_bf16_at_load():
 
     out, _ = layer(x)
     assert torch.equal(out, ref_out)
+
+
+# ---------------------------------------------------------------------------
+# Unshuffled serialized checkpoints (TP-capable format; TP=1 equivalence here)
+# ---------------------------------------------------------------------------
+
+
+def test_pack_unshuffled_then_shuffle_equals_packed():
+    """The provider split must reproduce the whole-weight pack: shuffle_for_kernel
+    of the unshuffled quant == pack_weight, byte-for-byte."""
+    from vllm_omni.quantization import flydsl_w4a8
+
+    torch.manual_seed(0)
+    w = (torch.randn(5120, 5120, device="cuda", dtype=torch.bfloat16) * 0.1).contiguous()
+    kw_p, ks_p = flydsl_w4a8.pack_weight(w)
+    wq, ws = flydsl_w4a8.pack_weight_unshuffled(w)
+    assert wq.shape == (5120, 2560) and ws.shape == (5120, 160)
+    kw_u, ks_u = flydsl_w4a8.shuffle_for_kernel(wq, ws)
+    assert torch.equal(kw_u, kw_p) and torch.equal(ks_u, ks_p)
+
+
+def test_plain_unshuffled_matches_packed_at_tp1():
+    from vllm_omni.quantization import flydsl_w4a8
+    from vllm_omni.quantization.quark_w4a8_config import (
+        DiffusionQuarkW4A8Config,
+        QuarkW4A8UnshuffledLinearMethod,
+    )
+
+    in_features = out_features = 5120
+    torch.manual_seed(0)
+    weight = (torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16) * 0.1).contiguous()
+    x = torch.randn(M_RAGGED, in_features, device="cuda", dtype=torch.bfloat16) * 0.5
+
+    ref = _make_layer(
+        DiffusionQuarkW4A8Config(is_checkpoint_w4a8_serialized=True), in_features, out_features, bias=False
+    )
+    ref.weight.weight_loader(ref.weight, weight)
+    ref_out, _ = ref(x)
+
+    wq, ws = flydsl_w4a8.pack_weight_unshuffled(weight)
+    cfg = DiffusionQuarkW4A8Config(is_checkpoint_w4a8_serialized=True, quark_export_format="mxfp4_unshuffled")
+    layer = _make_layer(cfg, in_features, out_features, bias=False)
+    assert isinstance(layer.quant_method, QuarkW4A8UnshuffledLinearMethod)
+    layer.weight_packed.data.copy_(wq)
+    layer.weight_scale.data.copy_(ws)
+    layer.quant_method.process_weights_after_loading(layer)
+
+    out, _ = layer(x)
+    assert torch.equal(out, ref_out)
+
+
+def test_svdquant_unshuffled_matches_packed_at_tp1():
+    from vllm_omni.quantization import flydsl_w4a8
+    from vllm_omni.quantization.quark_w4a8_config import (
+        DiffusionQuarkW4A8Config,
+        QuarkW4A8SVDUnshuffledLinearMethod,
+    )
+
+    in_features = out_features = 5120
+    rank = 32
+    torch.manual_seed(0)
+    weight, proj_up, proj_down = _spectral_weight(out_features, in_features, rank)
+    residual = (weight - proj_up @ proj_down).to(torch.bfloat16).contiguous()
+    proj_down = proj_down.to(torch.bfloat16).contiguous()
+    proj_up = proj_up.to(torch.bfloat16).contiguous()
+    x = torch.randn(M_RAGGED, in_features, device="cuda", dtype=torch.bfloat16) * 0.5
+
+    ref = _make_layer(
+        DiffusionQuarkW4A8Config(svd_rank=rank, is_checkpoint_w4a8_serialized=True),
+        in_features,
+        out_features,
+        bias=False,
+    )
+    ref.weight.data.copy_(residual)
+    ref.proj_down.data.copy_(proj_down)
+    ref.proj_up.data.copy_(proj_up)
+    ref.quant_method.process_weights_after_loading(ref)
+    ref_out, _ = ref(x)
+
+    wq, ws = flydsl_w4a8.pack_weight_unshuffled(residual)
+    cfg = DiffusionQuarkW4A8Config(
+        svd_rank=rank, is_checkpoint_w4a8_serialized=True, quark_export_format="mxfp4_unshuffled"
+    )
+    layer = _make_layer(cfg, in_features, out_features, bias=False)
+    assert isinstance(layer.quant_method, QuarkW4A8SVDUnshuffledLinearMethod)
+    layer.weight_packed.data.copy_(wq)
+    layer.weight_scale.data.copy_(ws)
+    layer.proj_down.data.copy_(proj_down)
+    layer.proj_up.data.copy_(proj_up)
+    layer.quant_method.process_weights_after_loading(layer)
+
+    out, _ = layer(x)
+    assert torch.equal(out, ref_out)

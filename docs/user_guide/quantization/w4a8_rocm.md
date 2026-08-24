@@ -161,13 +161,16 @@ Notes:
 - **SVD convention.** Quark places all singular values in `proj_down` (`L1`) and
   keeps `proj_up` (`L2`) orthonormal — the opposite of the online path's
   `sqrt(S)` split. The loader consumes them verbatim; do not rebalance.
-- **`--pack` (compact format).** By default the residual is stored unpacked BF16
-  and packed to the kernel layout at load. `--pack` instead stores it already
-  packed (`weight_shuffle`/`weight_scale` uint8, `quark_export_format:
-  "mxfp4_packed"` in the config): **~4× smaller** on disk and no per-layer pack at
-  load. The low-rank factors stay BF16. The trade-off is portability — the packed
-  layout is tied to the kernel's pack version, so keep unpacked BF16 as the
-  archival format and use `--pack` for a fast-loading deployment copy.
+- **`--pack-format` (compact 4-bit formats).** By default (`bf16`) the residual is
+  stored unpacked and packed at load. Two opt-in 4-bit formats are **~4× smaller**
+  on disk (low-rank factors stay BF16); both couple the checkpoint to the kernel's
+  pack version, so keep a BF16 copy as the archival format.
+    - `--pack-format packed`: preshuffled into the kernel layout
+      (`weight_shuffle`/`weight_scale`) — fastest load, but **TP=1 only** (the
+      shuffle bakes in K/N).
+    - `--pack-format unshuffled`: natural-order MXFP4 (`weight_packed`/
+      `weight_scale`) that vLLM can shard for **TP>1**; each rank shuffles its
+      shard at load. TP=1 output is bit-identical to `packed`.
 
 ## Layers that stay in BF16
 
@@ -204,9 +207,12 @@ capability answer, not an error.
 
 ## Limitations
 
-- **TP=1 only.** Tensor parallelism is unvalidated. `quark_svdquant` additionally
-  has no defined sharding for the rank dimension of `proj_down` / `proj_up`, so
-  both variants raise on `tp_size > 1`.
+- **Tensor parallelism** requires an `--pack-format unshuffled` checkpoint (the
+  preshuffled/BF16 paths raise on `tp_size > 1`). Plain W4A8 supports column- and
+  row-parallel; `quark_svdquant` supports **column-parallel only** — row-parallel
+  needs an all-reduce of the low-rank term and raises for now. TP>1 is wired but
+  **unvalidated on multi-GPU** (the dev box has one GPU); TP=1 is verified
+  bit-identical to the single-GPU path.
 - **Load time.** `quark_svdquant` runs a randomized truncated SVD per layer at
   load. It is O(rank) work, not a full decomposition, but it is not free on a
   28B dual-expert model.

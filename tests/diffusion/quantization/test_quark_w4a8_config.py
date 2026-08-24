@@ -438,6 +438,114 @@ def test_packed_create_weights_registers_uint8_shapes(_supported):
     assert layer.proj_up.shape == (3072, 96)
 
 
+# ---------------------------------------------------------------------------
+# Unshuffled serialized checkpoints (mxfp4_unshuffled, TP>1)
+# ---------------------------------------------------------------------------
+
+
+def test_serialized_unshuffled_plain_routes(_supported):
+    from vllm_omni.quantization.quark_w4a8_config import (
+        DiffusionQuarkW4A8Config,
+        QuarkW4A8UnshuffledLinearMethod,
+    )
+
+    cfg = DiffusionQuarkW4A8Config(is_checkpoint_w4a8_serialized=True, quark_export_format="mxfp4_unshuffled")
+    assert isinstance(cfg.get_quant_method(_fake_linear(5120, 5120), "to_q"), QuarkW4A8UnshuffledLinearMethod)
+
+
+def test_serialized_unshuffled_svd_routes(_supported):
+    from vllm_omni.quantization.quark_w4a8_config import (
+        DiffusionQuarkW4A8Config,
+        QuarkW4A8SVDUnshuffledLinearMethod,
+    )
+
+    cfg = DiffusionQuarkW4A8Config(
+        svd_rank=32, is_checkpoint_w4a8_serialized=True, quark_export_format="mxfp4_unshuffled"
+    )
+    assert isinstance(cfg.get_quant_method(_fake_linear(5120, 5120), "to_q"), QuarkW4A8SVDUnshuffledLinearMethod)
+
+
+def test_unshuffled_plain_create_weights_shardable_params(_supported):
+    """weight_packed is a PackedvLLMParameter (shards K via packed_dim) and
+    weight_scale a GroupQuantScaleParameter — the classes that let vLLM shard for TP."""
+    from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
+
+    from vllm_omni.quantization.quark_w4a8_config import (
+        DiffusionQuarkW4A8Config,
+        QuarkW4A8UnshuffledLinearMethod,
+    )
+
+    cfg = DiffusionQuarkW4A8Config(is_checkpoint_w4a8_serialized=True, quark_export_format="mxfp4_unshuffled")
+    method = QuarkW4A8UnshuffledLinearMethod(cfg)
+    layer = torch.nn.Module()
+    method.create_weights(
+        layer,
+        input_size_per_partition=3072,
+        output_partition_sizes=[5120],
+        input_size=3072,
+        output_size=5120,
+        params_dtype=torch.bfloat16,
+        weight_loader=lambda *a, **k: None,
+    )
+    assert isinstance(layer.weight_packed, PackedvLLMParameter)
+    assert isinstance(layer.weight_scale, GroupQuantScaleParameter)
+    assert layer.weight_packed.shape == (5120, 1536) and layer.weight_packed.dtype == torch.uint8
+    assert layer.weight_scale.shape == (5120, 96) and layer.weight_scale.dtype == torch.uint8
+
+
+def test_unshuffled_svd_create_weights_replicates_proj_down(_supported):
+    """proj_up shards on N (ModelWeightParameter, output_dim=0); proj_down is a
+    replicated BasevLLMParameter (K full under column-parallel)."""
+    from vllm.model_executor.parameter import BasevLLMParameter, ModelWeightParameter
+
+    from vllm_omni.quantization.quark_w4a8_config import (
+        DiffusionQuarkW4A8Config,
+        QuarkW4A8SVDUnshuffledLinearMethod,
+    )
+
+    cfg = DiffusionQuarkW4A8Config(
+        svd_rank=32, is_checkpoint_w4a8_serialized=True, quark_export_format="mxfp4_unshuffled"
+    )
+    method = QuarkW4A8SVDUnshuffledLinearMethod(cfg)
+    layer = torch.nn.Module()
+    method.create_weights(
+        layer,
+        input_size_per_partition=3072,
+        output_partition_sizes=[1024, 1024, 1024],
+        input_size=3072,
+        output_size=3072,
+        params_dtype=torch.bfloat16,
+        weight_loader=lambda *a, **k: None,
+    )
+    assert layer.proj_up.shape == (3072, 96) and isinstance(layer.proj_up, ModelWeightParameter)
+    assert layer.proj_down.shape == (96, 3072) and isinstance(layer.proj_down, BasevLLMParameter)
+
+
+def test_unshuffled_svd_rejects_row_parallel_tp(_supported):
+    """Row-parallel SVD needs an all-reduce of the low-rank term; refuse it."""
+    from vllm_omni.quantization.quark_w4a8_config import (
+        DiffusionQuarkW4A8Config,
+        QuarkW4A8SVDUnshuffledLinearMethod,
+    )
+
+    cfg = DiffusionQuarkW4A8Config(
+        svd_rank=32, is_checkpoint_w4a8_serialized=True, quark_export_format="mxfp4_unshuffled"
+    )
+    method = QuarkW4A8SVDUnshuffledLinearMethod(cfg)
+    layer = torch.nn.Module()
+    layer.tp_size = 2
+    with pytest.raises(NotImplementedError, match="row-parallel"):
+        method.create_weights(
+            layer,
+            input_size_per_partition=1536,  # < input_size -> input (K) sharded = row-parallel
+            output_partition_sizes=[5120],
+            input_size=3072,
+            output_size=5120,
+            params_dtype=torch.bfloat16,
+            weight_loader=lambda *a, **k: None,
+        )
+
+
 def test_unsupported_hardware_raises(monkeypatch):
     """Silently falling back to BF16 for the whole model would look like a
     successful quantized run, so an unusable backend must be an error."""

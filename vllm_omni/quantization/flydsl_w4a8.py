@@ -132,6 +132,10 @@ class _Provider(NamedTuple):
     gemm: Callable[..., torch.Tensor]
     svd_gemm: Callable[..., torch.Tensor]
     pack_weight: Callable[..., tuple[torch.Tensor, torch.Tensor]]
+    # Split of pack_weight for TP: quantize to MXFP4 in *natural* (shardable)
+    # order, then shuffle a per-rank shard into the kernel layout at load.
+    pack_weight_unshuffled: Callable[..., tuple[torch.Tensor, torch.Tensor]]
+    shuffle_for_kernel: Callable[..., tuple[torch.Tensor, torch.Tensor]]
 
 
 @functools.lru_cache(maxsize=1)
@@ -156,10 +160,13 @@ def _provider() -> _Provider:
 def _load_quark_provider() -> _Provider:
     """Phase 1 provider, backed by Quark's vendored FlyDSL kernels."""
     try:
+        import aiter
+        from aiter.ops.shuffle import shuffle_weight
         from quark.torch.quantization.nn.modules.aiter_fp4_inference_linear import _pack_weight_asm
         from quark.torch.quantization.nn.modules.flydsl_a8w4_inference_linear import (
             _gemm_flydsl_a8w4,
             _gemm_flydsl_svdquant,
+            _shuffle_e8m0_scale,
         )
     except ImportError as exc:
         raise ImportError(
@@ -168,11 +175,28 @@ def _load_quark_provider() -> _Provider:
             f"(branch xiaoyu/svd-quant-flydsl) from source."
         ) from exc
 
+    _quant = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+
+    def _pack_unshuffled(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Natural (N, K/2) MXFP4 + (N, K/32) E8M0 -- no weight/scale shuffle, so a
+        # per-rank slice along N or K is still a valid sub-matrix.
+        w_q, w_s = _quant(weight, shuffle=False)
+        return w_q.view(torch.uint8), w_s.view(torch.uint8)
+
+    def _shuffle_for_kernel(w_q: torch.Tensor, w_s: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Applied to a per-rank shard at load: shuffle_weight + _shuffle_e8m0_scale
+        # reproduce _pack_weight_asm's preshuffled layout exactly (verified equal).
+        kernel_w = shuffle_weight(w_q, layout=(16, 16)).view(torch.uint8).contiguous()
+        kernel_s = _shuffle_e8m0_scale(w_s.view(torch.uint8)).view(torch.uint8).contiguous()
+        return kernel_w, kernel_s
+
     return _Provider(
         name="quark",
         gemm=_gemm_flydsl_a8w4,
         svd_gemm=_gemm_flydsl_svdquant,
         pack_weight=_pack_weight_asm,
+        pack_weight_unshuffled=_pack_unshuffled,
+        shuffle_for_kernel=_shuffle_for_kernel,
     )
 
 
@@ -197,6 +221,26 @@ def pack_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     packed, scale = _provider().pack_weight(weight)
     return packed.view(torch.uint8), scale.view(torch.uint8)
+
+
+def pack_weight_unshuffled(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize to MXFP4 in *natural* order (no kernel shuffle), for TP.
+
+    Returns ``(weight_packed (N, K/2), weight_scale (N, K/32))`` uint8. Unlike
+    :func:`pack_weight`, a per-rank slice of these along N (output) or K (input)
+    is still a valid sub-matrix, so vLLM can shard them; each rank then calls
+    :func:`shuffle_for_kernel` on its local shard.
+    """
+    return _provider().pack_weight_unshuffled(weight)
+
+
+def shuffle_for_kernel(weight_packed: torch.Tensor, weight_scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Shuffle an unshuffled MXFP4 shard into the GEMM's preshuffled layout.
+
+    Run per rank on the local shard. Reproduces :func:`pack_weight`'s bytes
+    exactly, so at TP=1 the result is bit-identical to packing the whole weight.
+    """
+    return _provider().shuffle_for_kernel(weight_packed, weight_scale)
 
 
 # --- custom ops --------------------------------------------------------------

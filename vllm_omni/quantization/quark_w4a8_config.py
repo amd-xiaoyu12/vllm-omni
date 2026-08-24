@@ -36,13 +36,22 @@ serialized case. The on-disk weights are unpacked BF16 (packed to the kernel lay
 at load), because the shuffled MXFP4 layout is kernel-specific rather than a stable
 format.
 
-An opt-in ``quark_export_format="mxfp4_packed"`` checkpoint instead stores the
-residual already packed (``weight_shuffle``/``weight_scale`` uint8) -- ~4x smaller
-and no pack at load, handled by :class:`QuarkW4A8PackedLinearMethod` /
-:class:`QuarkW4A8SVDPackedLinearMethod`. This trades portability for size/speed: the
-packed layout is tied to the kernel's pack version.
+Two opt-in on-disk 4-bit formats (``quark_export_format``), both ~4x smaller than
+BF16 and tied to the kernel's pack version:
 
-Both variants only support TP=1 today; see ``_reject_tp`` below.
+* ``mxfp4_packed`` -- residual *preshuffled* into the kernel layout
+  (``weight_shuffle``/``weight_scale``), fastest load, **TP=1 only** (the shuffle
+  bakes in K/N). :class:`QuarkW4A8PackedLinearMethod` / ...SVD variant.
+* ``mxfp4_unshuffled`` -- residual in *natural* order (``weight_packed``/
+  ``weight_scale``), shardable for **TP>1**; each rank shuffles its shard at load
+  via ``flydsl_w4a8.shuffle_for_kernel``. :class:`QuarkW4A8UnshuffledLinearMethod`
+  (plain, column- and row-parallel) / :class:`QuarkW4A8SVDUnshuffledLinearMethod`
+  (SVD, column-parallel only -- row-parallel needs an all-reduce of the low-rank
+  term, not yet wired).
+
+TP support: only the ``mxfp4_unshuffled`` methods allow TP>1; every other path
+calls ``_reject_tp``. TP>1 is wired but unvalidated on multi-GPU (dev box has 1
+GPU); TP=1 is bit-identical to the packed path.
 """
 
 from __future__ import annotations
@@ -63,7 +72,12 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.model_loader.weight_utils import initialize_single_dummy_weight
-from vllm.model_executor.parameter import ModelWeightParameter
+from vllm.model_executor.parameter import (
+    BasevLLMParameter,
+    GroupQuantScaleParameter,
+    ModelWeightParameter,
+    PackedvLLMParameter,
+)
 
 from vllm_omni.quantization import flydsl_w4a8
 from vllm_omni.quantization._copy_missing_attrs import (
@@ -96,9 +110,9 @@ class DiffusionQuarkW4A8Config(QuantizationConfig):
             (BF16 residual + on-disk ``proj_down``/``proj_up`` factors) instead of
             quantizing a stock BF16 checkpoint at load. See the module docstring.
         quark_export_format: on-disk residual format of a serialized checkpoint.
-            ``"mxfp4_packed"`` = residual pre-packed to the kernel layout
-            (``weight_shuffle``/``weight_scale``); ``None``/``"bf16"`` = unpacked
-            BF16 residual packed at load.
+            ``None``/``"bf16"`` = unpacked BF16, packed at load; ``"mxfp4_packed"``
+            = preshuffled MXFP4 (TP=1); ``"mxfp4_unshuffled"`` = natural-order
+            MXFP4, shardable for TP>1 (shuffled per shard at load).
     """
 
     def __init__(
@@ -184,11 +198,19 @@ class DiffusionQuarkW4A8Config(QuantizationConfig):
             # The exporter guarantees factors exist iff the fused shape passes
             # supports_svd_shape, so shape routing here stays consistent with what
             # the checkpoint actually carries.
-            packed = self.quark_export_format == "mxfp4_packed"
+            fmt = self.quark_export_format
             if self.svd_rank is not None and flydsl_w4a8.supports_svd_shape(in_features, out_features):
-                return (QuarkW4A8SVDPackedLinearMethod if packed else QuarkW4A8SVDCheckpointLinearMethod)(self)
+                if fmt == "mxfp4_unshuffled":
+                    return QuarkW4A8SVDUnshuffledLinearMethod(self)
+                if fmt == "mxfp4_packed":
+                    return QuarkW4A8SVDPackedLinearMethod(self)
+                return QuarkW4A8SVDCheckpointLinearMethod(self)
             if flydsl_w4a8.supports_shape(in_features, out_features):
-                return (QuarkW4A8PackedLinearMethod if packed else QuarkW4A8CheckpointLinearMethod)(self)
+                if fmt == "mxfp4_unshuffled":
+                    return QuarkW4A8UnshuffledLinearMethod(self)
+                if fmt == "mxfp4_packed":
+                    return QuarkW4A8PackedLinearMethod(self)
+                return QuarkW4A8CheckpointLinearMethod(self)
             logger.warning(
                 "quark_w4a8 (serialized): %s has shape (out=%d, in=%d), which the kernel "
                 "cannot tile; keeping this layer in BF16.",
@@ -757,6 +779,167 @@ class QuarkW4A8SVDPackedLinearMethod(QuarkW4A8SVDLinearMethod):
         proj_down = layer.proj_down.data
         proj_up = layer.proj_up.data
         _install_packed_kernel_buffers(layer)
+        _swap_param_to_buffer(layer, "proj_down", proj_down)
+        _swap_param_to_buffer(layer, "proj_up", proj_up)
+        layer._already_called_process_weights_after_loading = True
+
+
+# ---------------------------------------------------------------------------
+# Unshuffled serialized checkpoints (--pack-format unshuffled): natural-order
+# MXFP4 on disk, shardable for TP>1; each rank shuffles its shard at load.
+# ---------------------------------------------------------------------------
+
+
+def _register_unshuffled_weight(
+    layer: Module, input_size_per_partition: int, output_size_per_partition: int, weight_loader
+) -> None:
+    """Register the shardable unshuffled MXFP4 residual.
+
+    ``weight_packed`` (N, K/2) as a ``PackedvLLMParameter`` (packed 2-per-byte on
+    K) and ``weight_scale`` (N, K/32) as a ``GroupQuantScaleParameter`` -- the
+    standard vLLM classes that shard a packed weight and a per-group scale along
+    the TP dim. Column-parallel shards N (``output_dim=0``); row-parallel shards
+    K (``input_dim=1``). K is always a multiple of 256, so a K-shard stays a
+    multiple of 256 (kernel) and 32 (scale group).
+    """
+    layer.register_parameter(
+        "weight_packed",
+        PackedvLLMParameter(
+            data=torch.empty(output_size_per_partition, input_size_per_partition // 2, dtype=torch.uint8),
+            input_dim=1,
+            output_dim=0,
+            packed_dim=1,
+            packed_factor=2,
+            weight_loader=weight_loader,
+        ),
+    )
+    layer.register_parameter(
+        "weight_scale",
+        GroupQuantScaleParameter(
+            data=torch.empty(output_size_per_partition, input_size_per_partition // 32, dtype=torch.uint8),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        ),
+    )
+
+
+def _install_unshuffled_kernel_buffers(layer: Module) -> None:
+    """Shuffle this rank's local shard into the kernel layout and drop the params.
+
+    Runs per rank after its shard is loaded, so the shuffle is applied to the
+    sharded (N/tp or K/tp) sub-matrix -- which is exactly what the per-rank GEMM
+    needs. At TP=1 this equals packing the whole weight (bytes verified equal).
+    """
+    kernel_weight, kernel_scale = flydsl_w4a8.shuffle_for_kernel(layer.weight_packed.data, layer.weight_scale.data)
+    for name in ("weight_packed", "weight_scale"):
+        if name in layer._parameters:
+            del layer._parameters[name]
+    layer.register_buffer("_kernel_weight", kernel_weight, persistent=False)
+    layer.register_buffer("_kernel_scale", kernel_scale, persistent=False)
+
+
+class QuarkW4A8UnshuffledLinearMethod(QuarkW4A8LinearMethod):
+    """Plain W4A8 from an unshuffled serialized checkpoint. TP>1 capable.
+
+    Both column-parallel (shard N) and row-parallel (shard K) work: vLLM shards
+    the natural-order ``weight_packed`` / ``weight_scale``, and each rank shuffles
+    its own shard into the kernel layout. Activations are quantized inside the
+    kernel per shard, so row-parallel needs no extra handling for the main GEMM.
+    """
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        output_size_per_partition = sum(output_partition_sizes)
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
+        layer.weight_block_size = None
+        _register_unshuffled_weight(
+            layer, input_size_per_partition, output_size_per_partition, extra_weight_attrs.get("weight_loader")
+        )
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+        _install_unshuffled_kernel_buffers(layer)
+        layer._already_called_process_weights_after_loading = True
+
+
+class QuarkW4A8SVDUnshuffledLinearMethod(QuarkW4A8SVDLinearMethod):
+    """SVD W4A8 from an unshuffled serialized checkpoint, column-parallel TP.
+
+    Column-parallel (QKV, gate/up): ``proj_up`` (N, R) shards on N, ``proj_down``
+    (R, K) is **replicated** (K full), so the low-rank term needs no communication
+    -- ``d = x @ proj_down.T`` is identical on every rank and the fused epilogue
+    runs per shard. Row-parallel (K shard) is refused: it would need an all-reduce
+    of the (M, R) low-rank intermediate before ``proj_up``, which is not yet wired.
+    """
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        output_size_per_partition = sum(output_partition_sizes)
+        tp_size = getattr(layer, "tp_size", 1)
+        # Row-parallel shards the input dim, so input_size_per_partition < input_size.
+        if tp_size > 1 and input_size_per_partition != input_size:
+            raise NotImplementedError(
+                "quark_w4a8 (svd) supports column-parallel TP only; row-parallel needs "
+                "an all-reduce of the low-rank term (not yet implemented). Got input "
+                f"sharded to {input_size_per_partition} of {input_size}."
+            )
+
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
+        layer.weight_block_size = None
+        _register_unshuffled_weight(layer, input_size_per_partition, output_size_per_partition, weight_loader)
+
+        assert self.quant_config.svd_rank is not None
+        rank_eff = self.quant_config.svd_rank * len(output_partition_sizes)
+        # proj_up (N, rank_eff): shards on N with the output (column-parallel).
+        layer.register_parameter(
+            "proj_up",
+            ModelWeightParameter(
+                data=torch.empty(output_size_per_partition, rank_eff, dtype=params_dtype),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            ),
+        )
+        # proj_down (rank_eff, K): replicated -- K is full under column-parallel.
+        layer.register_parameter(
+            "proj_down",
+            BasevLLMParameter(
+                data=torch.empty(rank_eff, input_size_per_partition, dtype=params_dtype),
+                weight_loader=weight_loader,
+            ),
+        )
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+        proj_down = layer.proj_down.data
+        proj_up = layer.proj_up.data
+        _install_unshuffled_kernel_buffers(layer)
         _swap_param_to_buffer(layer, "proj_down", proj_down)
         _swap_param_to_buffer(layer, "proj_up", proj_up)
         layer._already_called_process_weights_after_loading = True

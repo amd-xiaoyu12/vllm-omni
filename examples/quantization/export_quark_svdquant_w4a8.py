@@ -70,6 +70,9 @@ WAN_SVDQUANT_EXCLUDE = [
 # match); these layers stay BF16 at load.
 _IGNORED_TOKENS = ["time_embedder", "patch_embedding", "condition_embedder", "norm_out", "proj_out"]
 
+# CLI --pack-format -> quark_export_format written into the checkpoint config.
+_EXPORT_FORMAT = {"bf16": "bf16", "packed": "mxfp4_packed", "unshuffled": "mxfp4_unshuffled"}
+
 # ErrorCorrectedModule state_dict -> vLLM-Omni canonical key. Order matters: the
 # correction/layer suffixes are checked before the bare ``.weight`` they contain.
 _ECM_REMAP = (
@@ -169,15 +172,20 @@ def _fold_unsupported_factors(sd: dict[str, torch.Tensor]) -> dict[str, torch.Te
     return sd
 
 
-def _pack_residuals(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Pre-pack each quantized residual weight to the FlyDSL MXFP4 kernel layout.
+def _pack_residuals(sd: dict[str, torch.Tensor], unshuffled: bool) -> dict[str, torch.Tensor]:
+    """Pre-pack each quantized residual weight to MXFP4 on disk.
 
-    ``X.weight`` (N, K) -> ``X.weight_shuffle`` (N, K/2) + ``X.weight_scale``
-    (N, K/32), both uint8, dropping the BF16 copy. ~4x smaller on disk and no
-    per-layer pack at load. Only weights that the loader will actually quantize
-    are packed -- ignored/untileable layers stay BF16 and load unquantized.
-    Low-rank ``proj_down``/``proj_up`` stay BF16. See the packing caveat in the
-    module docstring: this couples the checkpoint to the kernel's pack version.
+    ``packed`` (``unshuffled=False``): ``X.weight`` -> ``X.weight_shuffle`` (N, K/2)
+    + ``X.weight_scale`` (N, K/32), preshuffled into the kernel layout. Fastest
+    load, but the shuffle bakes in K/N so it is **TP=1 only**.
+
+    ``unshuffled`` (``unshuffled=True``): ``X.weight`` -> ``X.weight_packed`` (N, K/2)
+    + ``X.weight_scale`` (N, K/32) in *natural* order, so vLLM can shard it for
+    **TP>1**; each rank shuffles its shard at load.
+
+    Both are ~4x smaller than BF16. Only weights the loader will quantize are
+    packed; ignored/untileable layers stay BF16. Low-rank ``proj_down``/``proj_up``
+    stay BF16. Either format couples the checkpoint to the kernel's pack version.
     """
     from vllm_omni.quantization import flydsl_w4a8
 
@@ -190,9 +198,13 @@ def _pack_residuals(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
             and not any(tok in base for tok in _IGNORED_TOKENS)
             and _omni_plain_ok(value.shape[0], value.shape[1])
         ):
-            packed, scale = flydsl_w4a8.pack_weight(value.to("cuda"))
-            out[f"{base}.weight_shuffle"] = packed.cpu().contiguous()
-            out[f"{base}.weight_scale"] = scale.cpu().contiguous()
+            if unshuffled:
+                w_q, w_s = flydsl_w4a8.pack_weight_unshuffled(value.to("cuda"))
+                out[f"{base}.weight_packed"] = w_q.cpu().contiguous()
+            else:
+                w_q, w_s = flydsl_w4a8.pack_weight(value.to("cuda"))
+                out[f"{base}.weight_shuffle"] = w_q.cpu().contiguous()
+            out[f"{base}.weight_scale"] = w_s.cpu().contiguous()
         else:
             out[key] = value
     return out
@@ -259,9 +271,9 @@ def write_component(out_dir: str, comp: str, sd: dict[str, torch.Tensor], args: 
         "is_checkpoint_w4a8_serialized": True,
         "producer": "quark",
         "variant": args.variant,
-        # "mxfp4_packed": residual pre-packed to the kernel layout (weight_shuffle +
-        # weight_scale). Absent/"bf16": unpacked BF16 residual, packed at load.
-        "quark_export_format": "mxfp4_packed" if args.pack else "bf16",
+        # bf16: unpacked residual (packed at load). mxfp4_packed: preshuffled on
+        # disk (TP=1). mxfp4_unshuffled: natural-order MXFP4 on disk (shardable, TP>1).
+        "quark_export_format": _EXPORT_FORMAT[args.pack_format],
         "ignored_layers": list(_IGNORED_TOKENS),
         "algo": {
             "svdquant": args.variant == "svdquant",
@@ -270,7 +282,7 @@ def write_component(out_dir: str, comp: str, sd: dict[str, torch.Tensor], args: 
             "gptq": args.gptq,
         },
     }
-    if args.pack:
+    if args.pack_format != "bf16":
         quant_config["packing"] = "flydsl_a8w4_preshuffle"
     if args.variant == "svdquant":
         quant_config["svd_rank"] = args.svd_rank
@@ -288,10 +300,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gptq", action="store_true", help="Residual GPTQ (svdquant only).")
     p.add_argument("--no_fuse_qkv", action="store_true", help="Debug: emit separate attn1 to_q/k/v.")
     p.add_argument(
-        "--pack",
-        action="store_true",
-        help="Pre-pack residual weights to the MXFP4 kernel layout on disk (~4x smaller, "
-        "faster load), instead of unpacked BF16. Couples the checkpoint to the kernel pack version.",
+        "--pack-format",
+        dest="pack_format",
+        default="bf16",
+        choices=["bf16", "packed", "unshuffled"],
+        help="On-disk residual format. bf16: unpacked, packed at load (default). "
+        "packed: preshuffled MXFP4 (~4x smaller, fastest load, TP=1 only). "
+        "unshuffled: natural-order MXFP4 (~4x smaller, shardable for TP>1, shuffled per shard at load).",
     )
     p.add_argument("--n_calib_prompts", type=int, default=2)
     p.add_argument("--n_calib_steps", type=int, default=20)
@@ -320,8 +335,8 @@ def main() -> int:
     os.makedirs(args.output_dir, exist_ok=True)
     for comp in comps:
         sd = quantize_component(pipe, comp, args)
-        if args.pack:
-            sd = _pack_residuals(sd)
+        if args.pack_format != "bf16":
+            sd = _pack_residuals(sd, unshuffled=args.pack_format == "unshuffled")
         write_component(args.output_dir, comp, sd, args)
 
     print(f"[export] DONE -> {args.output_dir}")
