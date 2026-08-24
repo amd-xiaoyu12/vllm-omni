@@ -173,10 +173,10 @@ Notes:
 - **Self-attention QKV is pre-fused in the exporter.** Wan fuses `to_q/k/v` into
   `to_qkv`, so the factors are emitted fused: `proj_down` stacked to rank
   `3 x svd_rank`, `proj_up` block-diagonal. The runtime needs no special handling.
-- **`--variant plain`** writes a portable pre-quantized artifact, but it is
-  RTN-equivalent to the online plain path — smoothing folds back to identity
-  without a low-rank branch. Genuine plain calibration would need `--gptq`
-  (residual GPTQ), which today is only wired for `--variant svdquant`.
+- **`--variant plain`** writes a portable pre-quantized artifact, but it is the
+  RTN tier — always uncalibrated, RTN-equivalent to the online plain path
+  (smoothing folds back to identity without a low-rank branch). `--gptq` (which
+  GPTQ-quantizes the SVD residual) applies only to `--variant svdquant`.
 - **SVD convention.** Quark places all singular values in `proj_down` (`L1`) and
   keeps `proj_up` (`L2`) orthonormal — the opposite of the online path's
   `sqrt(S)` split. The loader consumes them verbatim; do not rebalance.

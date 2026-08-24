@@ -9,14 +9,19 @@ Two variants, both consumed by ``quantization="quark_w4a8"`` with
   smoothing + exact SVD on the smoothed weight), emitting the BF16 residual ``R``
   plus low-rank factors ``proj_down`` (=L1) / ``proj_up`` (=L2). This is the
   *calibrated* counterpart to vLLM-Omni's online ``torch.svd_lowrank`` path, which
-  sees only the raw weight.
-* ``plain`` -- a portable pre-quantized artifact carrying the stock BF16 weights.
-  RTN-equivalent to the online plain path unless ``--gptq`` (residual GPTQ, only
-  meaningful with ``svdquant``); smoothing alone folds back to identity without a
-  low-rank branch, so it is *not* applied to plain.
+  sees only the raw weight. ``--gptq`` additionally quantizes the residual with
+  Hessian-based GPTQ (using the calibration data) instead of RTN.
+* ``plain`` -- the **RTN tier** (round-to-nearest MXFP4 weight; no low-rank branch,
+  no calibration -- always uncalibrated). The export just copies the stock weights;
+  vLLM-Omni RTN-quantizes them to MXFP4 at load, exactly as the *online* plain path
+  does -- so a default-format plain export is the stock checkpoint round-tripped,
+  useful only as a portable/reproducible artifact. "BF16" here is the on-disk
+  storage, not the served precision.
 
-Weights are written **unpacked BF16**; vLLM-Omni packs them to the FlyDSL MXFP4
-layout at load. Self-attention ``to_q/to_k/to_v`` are pre-fused into ``to_qkv``
+By default (``--pack-format bf16``) the residual is written **unpacked BF16** and
+vLLM-Omni RTN-packs it to the FlyDSL MXFP4 layout at load; ``--pack-format
+packed``/``unshuffled`` instead store the residual already MXFP4-packed (~4x
+smaller). Self-attention ``to_q/to_k/to_v`` are pre-fused into ``to_qkv``
 here (residual concatenated, ``proj_down`` stacked, ``proj_up`` block-diagonal)
 because the fused layer's low-rank factors cannot be reassembled by the runtime
 shard loader the way a plain weight can.
@@ -214,13 +219,11 @@ def quantize_component(pipe, comp: str, args: argparse.Namespace) -> dict[str, t
     transformer = getattr(pipe, comp)
     print(f"[export] {comp}: {type(transformer).__name__}")
 
-    if args.variant == "plain" and not args.gptq:
+    if args.variant == "plain":
         # A portable pre-quant artifact; RTN happens at load. Smoothing is a
         # no-op without a low-rank branch, so nothing calibrated to do here.
+        # (--gptq + plain is rejected at parse time.)
         return build_omni_state_dict(transformer, variant="plain", fuse_qkv=False)
-
-    if args.variant == "plain" and args.gptq:
-        raise SystemExit("--gptq is only supported with --variant svdquant in this version.")
 
     from quark.torch.algorithm.svdquant.svdquant import SVDQuantProcessor
     from quark.torch.quantization.config.config import SVDQuantConfig
@@ -315,7 +318,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--width", type=int, default=448)
     p.add_argument("--guidance_scale", type=float, default=5.0)
     p.add_argument("--output_dir", required=True)
-    return p.parse_args()
+    args = p.parse_args()
+    # GPTQ acts on the SVD residual; plain has no residual. Reject at parse time
+    # so it fails before the pipeline loads, not tens of minutes into calibration.
+    if args.gptq and args.variant == "plain":
+        p.error("--gptq requires --variant svdquant (plain has no residual to quantize)")
+    return args
 
 
 def main() -> int:
