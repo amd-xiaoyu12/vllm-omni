@@ -523,10 +523,11 @@ def test_unshuffled_plain_create_weights_shardable_params(_supported):
     assert layer.weight_scale.shape == (5120, 96) and layer.weight_scale.dtype == torch.uint8
 
 
-def test_unshuffled_svd_create_weights_replicates_proj_down(_supported):
-    """proj_up shards on N (ModelWeightParameter, output_dim=0); proj_down is a
-    replicated BasevLLMParameter (K full under column-parallel)."""
-    from vllm.model_executor.parameter import BasevLLMParameter, ModelWeightParameter
+def test_unshuffled_svd_factor_param_axes(_supported):
+    """proj_up on the output axis (_ColumnvLLMParameter, shards N column-parallel);
+    proj_down on the input axis (RowvLLMParameter, shards K row-parallel). Each
+    replicates on the other parallelism, so both directions work with no branch."""
+    from vllm.model_executor.parameter import RowvLLMParameter, _ColumnvLLMParameter
 
     from vllm_omni.quantization.quark_w4a8_config import (
         _STORAGES,
@@ -548,12 +549,14 @@ def test_unshuffled_svd_create_weights_replicates_proj_down(_supported):
         params_dtype=torch.bfloat16,
         weight_loader=lambda *a, **k: None,
     )
-    assert layer.proj_up.shape == (3072, 96) and isinstance(layer.proj_up, ModelWeightParameter)
-    assert layer.proj_down.shape == (96, 3072) and isinstance(layer.proj_down, BasevLLMParameter)
+    assert layer.proj_up.shape == (3072, 96) and isinstance(layer.proj_up, _ColumnvLLMParameter)
+    assert layer.proj_down.shape == (96, 3072) and isinstance(layer.proj_down, RowvLLMParameter)
 
 
-def test_unshuffled_svd_rejects_row_parallel_tp(_supported):
-    """Row-parallel SVD needs an all-reduce of the low-rank term; refuse it."""
+def test_unshuffled_svd_accepts_row_parallel_tp(_supported):
+    """Row-parallel SVD is supported on the unshuffled storage: proj_down shards
+    on K (input dim), proj_up replicates, and the correction rides the layer's
+    output all-reduce -- so create_weights must not raise."""
     from vllm_omni.quantization.quark_w4a8_config import (
         _STORAGES,
         DiffusionQuarkW4A8Config,
@@ -566,12 +569,37 @@ def test_unshuffled_svd_rejects_row_parallel_tp(_supported):
     method = QuarkW4A8SVDLinearMethod(cfg, _STORAGES["mxfp4_unshuffled"], derive_factors=False)
     layer = torch.nn.Module()
     layer.tp_size = 2
-    with pytest.raises(NotImplementedError, match="row-parallel"):
+    method.create_weights(
+        layer,
+        input_size_per_partition=1536,  # < input_size -> input (K) sharded = row-parallel
+        output_partition_sizes=[5120],
+        input_size=3072,
+        output_size=5120,
+        params_dtype=torch.bfloat16,
+        weight_loader=lambda *a, **k: None,
+    )
+    assert layer.proj_down.shape == (32, 1536)  # sharded on K
+    assert layer.proj_up.shape == (5120, 32)  # replicated
+
+
+def test_bf16_svd_still_rejects_tp(_supported):
+    """A non-shardable storage (bf16/packed) still refuses TP>1 in either direction."""
+    from vllm_omni.quantization.quark_w4a8_config import (
+        _STORAGES,
+        DiffusionQuarkW4A8Config,
+        QuarkW4A8SVDLinearMethod,
+    )
+
+    cfg = DiffusionQuarkW4A8Config(svd_rank=32, is_checkpoint_w4a8_serialized=True)
+    method = QuarkW4A8SVDLinearMethod(cfg, _STORAGES["bf16"], derive_factors=False)
+    layer = torch.nn.Module()
+    layer.tp_size = 2
+    with pytest.raises(NotImplementedError, match="cannot be sharded"):
         method.create_weights(
             layer,
-            input_size_per_partition=1536,  # < input_size -> input (K) sharded = row-parallel
+            input_size_per_partition=5120,
             output_partition_sizes=[5120],
-            input_size=3072,
+            input_size=5120,
             output_size=5120,
             params_dtype=torch.bfloat16,
             weight_loader=lambda *a, **k: None,

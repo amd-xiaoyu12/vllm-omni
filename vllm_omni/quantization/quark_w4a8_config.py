@@ -49,10 +49,11 @@ residual's storage to a ``_Storage`` strategy, selected by ``quark_export_format
   ``weight_scale``), shardable for **TP>1**; each rank shuffles its shard at load
   via ``flydsl_w4a8.shuffle_for_kernel``.
 
-TP: ``_check_parallelism`` allows TP>1 only on the shardable (unshuffled) storage,
-and refuses row-parallel for the SVD method (the low-rank term would need an
-all-reduce). TP>1 is wired but unvalidated on multi-GPU (dev box has 1 GPU); TP=1
-is bit-identical to the packed path.
+TP: ``_check_parallelism`` allows TP>1 only on the shardable (unshuffled) storage.
+Plain and SVD both support column- and row-parallel; the SVD low-rank term needs
+no new collective -- its per-rank partial ``d_p @ proj_up.T`` rides the layer's
+existing output all-reduce. TP>1 is wired but unvalidated on multi-GPU (dev box has
+1 GPU); TP=1 is bit-identical to the packed path.
 """
 
 from __future__ import annotations
@@ -74,10 +75,11 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.model_loader.weight_utils import initialize_single_dummy_weight
 from vllm.model_executor.parameter import (
-    BasevLLMParameter,
     GroupQuantScaleParameter,
     ModelWeightParameter,
     PackedvLLMParameter,
+    RowvLLMParameter,
+    _ColumnvLLMParameter,
 )
 
 from vllm_omni.quantization import flydsl_w4a8
@@ -563,10 +565,15 @@ class QuarkW4A8SVDLinearMethod(QuarkW4A8LinearMethod):
     The 4-bit operand is the residual ``Wr = W - L2 @ L1``; ``proj_down`` (R, K)
     and ``proj_up`` (N, R) stay BF16. ``derive_factors`` picks the provenance:
     online (``svd_lowrank`` at load) vs loaded from a serialized checkpoint.
-    Row-parallel TP is refused -- the low-rank term would need an all-reduce.
+
+    Column- and row-parallel both work on a shardable storage: each factor is
+    registered on the layer axis it shares (``proj_up`` on N, ``proj_down`` on K),
+    so vLLM shards it for the matching parallelism and replicates it otherwise.
+    Row-parallel needs no new collective -- by linearity the per-rank partial
+    ``d_p @ proj_up.T`` rides the layer's existing output all-reduce.
     """
 
-    row_parallel_ok = False
+    row_parallel_ok = True
 
     def __init__(self, quant_config: DiffusionQuarkW4A8Config, storage: _Storage, derive_factors: bool) -> None:
         super().__init__(quant_config, storage)
@@ -587,35 +594,28 @@ class QuarkW4A8SVDLinearMethod(QuarkW4A8LinearMethod):
         rank = self.quant_config.svd_rank
         assert rank is not None
         rank_eff = rank * len(output_partition_sizes)
+        # Each factor shares exactly one of the layer's axes, so register it on
+        # that axis with a single-axis parameter class: vLLM shards it for the
+        # matching parallelism and replicates it for the other. No row/column
+        # branch, and row-parallel needs no new collective.
+        #   proj_up   (N, rank_eff) -> output axis N (column shards, row replicates)
+        #   proj_down (rank_eff, K) -> input axis K  (row shards, column replicates)
         layer.register_parameter(
             "proj_up",
-            ModelWeightParameter(
+            _ColumnvLLMParameter(
                 data=torch.empty(sum(output_partition_sizes), rank_eff, dtype=params_dtype),
-                input_dim=1,
                 output_dim=0,
                 weight_loader=weight_loader,
             ),
         )
-        # Under column-parallel TP (shardable storage) proj_down (rank_eff, K) is
-        # replicated because K stays full, so it carries no shard metadata.
-        if self.storage.shardable:
-            layer.register_parameter(
-                "proj_down",
-                BasevLLMParameter(
-                    data=torch.empty(rank_eff, input_size_per_partition, dtype=params_dtype),
-                    weight_loader=weight_loader,
-                ),
-            )
-        else:
-            layer.register_parameter(
-                "proj_down",
-                ModelWeightParameter(
-                    data=torch.empty(rank_eff, input_size_per_partition, dtype=params_dtype),
-                    input_dim=1,
-                    output_dim=0,
-                    weight_loader=weight_loader,
-                ),
-            )
+        layer.register_parameter(
+            "proj_down",
+            RowvLLMParameter(
+                data=torch.empty(rank_eff, input_size_per_partition, dtype=params_dtype),
+                input_dim=1,
+                weight_loader=weight_loader,
+            ),
+        )
 
     def _prepare_factors(self, layer: Module) -> None:
         if self.derive_factors:

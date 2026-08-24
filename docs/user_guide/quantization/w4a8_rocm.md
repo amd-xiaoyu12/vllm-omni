@@ -227,10 +227,14 @@ capability answer, not an error.
 ## Limitations
 
 - **Tensor parallelism** requires an `--pack-format unshuffled` checkpoint (the
-  preshuffled/BF16 paths raise on `tp_size > 1`). Plain W4A8 supports column- and
-  row-parallel; `quark_svdquant` supports **column-parallel only** — row-parallel
-  needs an all-reduce of the low-rank term and raises for now. TP>1 is wired but
-  **unvalidated on multi-GPU** (the dev box has one GPU); TP=1 is verified
+  preshuffled/BF16 paths raise on `tp_size > 1`). Both plain W4A8 and
+  `quark_svdquant` support **column- and row-parallel**; the SVD low-rank term
+  needs no extra collective — by linearity its per-rank partial `d_p @ proj_up.T`
+  rides the layer's existing output all-reduce (`proj_up` shares the N axis and is
+  sharded/replicated with it; `proj_down` shares K). The sharding math is verified
+  on gfx950 (`test_flydsl_w4a8_tp_rocm.py` decomposition tests), but the end-to-end
+  multi-GPU run is **unvalidated** (the dev box has one GPU) — run
+  `test_svd_row_parallel_end_to_end_multigpu` on a ≥ 2-GPU server. TP=1 is
   bit-identical to the single-GPU path.
 - **Load time.** `quark_svdquant` runs a randomized truncated SVD per layer at
   load. It is O(rank) work, not a full decomposition, but it is not free on a
