@@ -263,7 +263,7 @@ def test_svdquant_keeps_projections_after_packing():
     assert layer.weight is None
     assert layer.proj_down is not None
     assert layer.proj_up is not None
-    assert layer.svd_rank == 32
+    assert layer.quant_method.quant_config.svd_rank == 32
     # Derived at load from a BF16 checkpoint, so they are not checkpoint keys.
     assert "proj_down" not in layer.state_dict()
     assert "proj_up" not in layer.state_dict()
@@ -303,7 +303,7 @@ def test_plain_serialized_checkpoint_matches_bf16():
     it at load, exactly like the online path (which it subclasses)."""
     from vllm_omni.quantization.quark_w4a8_config import (
         DiffusionQuarkW4A8Config,
-        QuarkW4A8CheckpointLinearMethod,
+        QuarkW4A8LinearMethod,
     )
 
     in_features = out_features = 5120
@@ -314,7 +314,8 @@ def test_plain_serialized_checkpoint_matches_bf16():
     layer = _make_layer(
         DiffusionQuarkW4A8Config(is_checkpoint_w4a8_serialized=True), in_features, out_features, bias=False
     )
-    assert isinstance(layer.quant_method, QuarkW4A8CheckpointLinearMethod)
+    assert type(layer.quant_method) is QuarkW4A8LinearMethod
+    assert layer.quant_method.storage.name == "bf16"
     layer.weight.weight_loader(layer.weight, weight)  # lazy pack triggers here
 
     out, _ = layer(x)
@@ -328,7 +329,7 @@ def test_svdquant_serialized_checkpoint_matches_bf16():
     them) and its fused output must track the full-precision weight."""
     from vllm_omni.quantization.quark_w4a8_config import (
         DiffusionQuarkW4A8Config,
-        QuarkW4A8SVDCheckpointLinearMethod,
+        QuarkW4A8SVDLinearMethod,
     )
 
     in_features = out_features = 5120
@@ -340,7 +341,8 @@ def test_svdquant_serialized_checkpoint_matches_bf16():
 
     cfg = DiffusionQuarkW4A8Config(svd_rank=rank, is_checkpoint_w4a8_serialized=True)
     layer = _make_layer(cfg, in_features, out_features, bias=False)
-    assert isinstance(layer.quant_method, QuarkW4A8SVDCheckpointLinearMethod)
+    assert isinstance(layer.quant_method, QuarkW4A8SVDLinearMethod)
+    assert layer.quant_method.storage.name == "bf16"
 
     # Serialized create_weights registers real (non-meta) params; fill from "disk".
     layer.weight.data.copy_(residual)
@@ -365,7 +367,7 @@ def test_plain_packed_matches_bf16_at_load():
     from vllm_omni.quantization import flydsl_w4a8
     from vllm_omni.quantization.quark_w4a8_config import (
         DiffusionQuarkW4A8Config,
-        QuarkW4A8PackedLinearMethod,
+        QuarkW4A8LinearMethod,
     )
 
     in_features = out_features = 5120
@@ -382,7 +384,8 @@ def test_plain_packed_matches_bf16_at_load():
     packed, scale = flydsl_w4a8.pack_weight(weight)
     cfg = DiffusionQuarkW4A8Config(is_checkpoint_w4a8_serialized=True, quark_export_format="mxfp4_packed")
     layer = _make_layer(cfg, in_features, out_features, bias=False)
-    assert isinstance(layer.quant_method, QuarkW4A8PackedLinearMethod)
+    assert type(layer.quant_method) is QuarkW4A8LinearMethod
+    assert layer.quant_method.storage.name == "mxfp4_packed"
     layer.weight_shuffle.data.copy_(packed)
     layer.weight_scale.data.copy_(scale)
     layer.quant_method.process_weights_after_loading(layer)
@@ -397,7 +400,7 @@ def test_svdquant_packed_matches_bf16_at_load():
     from vllm_omni.quantization import flydsl_w4a8
     from vllm_omni.quantization.quark_w4a8_config import (
         DiffusionQuarkW4A8Config,
-        QuarkW4A8SVDPackedLinearMethod,
+        QuarkW4A8SVDLinearMethod,
     )
 
     in_features = out_features = 5120
@@ -426,7 +429,8 @@ def test_svdquant_packed_matches_bf16_at_load():
         svd_rank=rank, is_checkpoint_w4a8_serialized=True, quark_export_format="mxfp4_packed"
     )
     layer = _make_layer(cfg, in_features, out_features, bias=False)
-    assert isinstance(layer.quant_method, QuarkW4A8SVDPackedLinearMethod)
+    assert isinstance(layer.quant_method, QuarkW4A8SVDLinearMethod)
+    assert layer.quant_method.storage.name == "mxfp4_packed"
     layer.weight_shuffle.data.copy_(packed)
     layer.weight_scale.data.copy_(scale)
     layer.proj_down.data.copy_(proj_down)
@@ -460,7 +464,7 @@ def test_plain_unshuffled_matches_packed_at_tp1():
     from vllm_omni.quantization import flydsl_w4a8
     from vllm_omni.quantization.quark_w4a8_config import (
         DiffusionQuarkW4A8Config,
-        QuarkW4A8UnshuffledLinearMethod,
+        QuarkW4A8LinearMethod,
     )
 
     in_features = out_features = 5120
@@ -477,7 +481,8 @@ def test_plain_unshuffled_matches_packed_at_tp1():
     wq, ws = flydsl_w4a8.pack_weight_unshuffled(weight)
     cfg = DiffusionQuarkW4A8Config(is_checkpoint_w4a8_serialized=True, quark_export_format="mxfp4_unshuffled")
     layer = _make_layer(cfg, in_features, out_features, bias=False)
-    assert isinstance(layer.quant_method, QuarkW4A8UnshuffledLinearMethod)
+    assert type(layer.quant_method) is QuarkW4A8LinearMethod
+    assert layer.quant_method.storage.name == "mxfp4_unshuffled"
     layer.weight_packed.data.copy_(wq)
     layer.weight_scale.data.copy_(ws)
     layer.quant_method.process_weights_after_loading(layer)
@@ -490,7 +495,7 @@ def test_svdquant_unshuffled_matches_packed_at_tp1():
     from vllm_omni.quantization import flydsl_w4a8
     from vllm_omni.quantization.quark_w4a8_config import (
         DiffusionQuarkW4A8Config,
-        QuarkW4A8SVDUnshuffledLinearMethod,
+        QuarkW4A8SVDLinearMethod,
     )
 
     in_features = out_features = 5120
@@ -519,7 +524,8 @@ def test_svdquant_unshuffled_matches_packed_at_tp1():
         svd_rank=rank, is_checkpoint_w4a8_serialized=True, quark_export_format="mxfp4_unshuffled"
     )
     layer = _make_layer(cfg, in_features, out_features, bias=False)
-    assert isinstance(layer.quant_method, QuarkW4A8SVDUnshuffledLinearMethod)
+    assert isinstance(layer.quant_method, QuarkW4A8SVDLinearMethod)
+    assert layer.quant_method.storage.name == "mxfp4_unshuffled"
     layer.weight_packed.data.copy_(wq)
     layer.weight_scale.data.copy_(ws)
     layer.proj_down.data.copy_(proj_down)

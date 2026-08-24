@@ -249,14 +249,15 @@ def test_non_linear_layer_returns_none():
     assert DiffusionQuarkW4A8Config().get_quant_method(torch.nn.LayerNorm(8), "norm") is None
 
 
-def test_plain_routes_to_online_method(_supported):
+def test_plain_routes_to_bf16_storage(_supported):
     from vllm_omni.quantization.quark_w4a8_config import (
         DiffusionQuarkW4A8Config,
-        QuarkW4A8OnlineLinearMethod,
+        QuarkW4A8LinearMethod,
     )
 
     method = DiffusionQuarkW4A8Config().get_quant_method(_fake_linear(5120, 5120), "to_q")
-    assert isinstance(method, QuarkW4A8OnlineLinearMethod)
+    assert type(method) is QuarkW4A8LinearMethod
+    assert method.storage.name == "bf16"
 
 
 def test_svd_routes_to_svd_method(_supported):
@@ -267,6 +268,8 @@ def test_svd_routes_to_svd_method(_supported):
 
     method = DiffusionQuarkW4A8Config(svd_rank=32).get_quant_method(_fake_linear(5120, 5120), "to_q")
     assert isinstance(method, QuarkW4A8SVDLinearMethod)
+    assert method.storage.name == "bf16"
+    assert method.derive_factors is True
 
 
 def test_ignored_layer_routes_to_bf16(_supported):
@@ -301,40 +304,58 @@ def test_untileable_shape_falls_back_to_bf16(_supported):
     assert isinstance(method, UnquantizedLinearMethod)
 
 
-def test_serialized_svd_routes_to_svd_checkpoint(_supported):
+def test_serialized_svd_routes_to_svd_bf16_loaded(_supported):
     from vllm_omni.quantization.quark_w4a8_config import (
         DiffusionQuarkW4A8Config,
-        QuarkW4A8SVDCheckpointLinearMethod,
+        QuarkW4A8SVDLinearMethod,
     )
 
     cfg = DiffusionQuarkW4A8Config(svd_rank=32, is_checkpoint_w4a8_serialized=True)
     method = cfg.get_quant_method(_fake_linear(5120, 5120), "to_q")
-    assert isinstance(method, QuarkW4A8SVDCheckpointLinearMethod)
+    assert isinstance(method, QuarkW4A8SVDLinearMethod)
+    assert method.storage.name == "bf16"
+    assert method.derive_factors is False
 
 
-def test_serialized_plain_routes_to_checkpoint(_supported):
+def test_serialized_plain_routes_to_bf16(_supported):
     from vllm_omni.quantization.quark_w4a8_config import (
         DiffusionQuarkW4A8Config,
-        QuarkW4A8CheckpointLinearMethod,
+        QuarkW4A8LinearMethod,
     )
 
     cfg = DiffusionQuarkW4A8Config(is_checkpoint_w4a8_serialized=True)
     method = cfg.get_quant_method(_fake_linear(5120, 5120), "to_q")
-    assert isinstance(method, QuarkW4A8CheckpointLinearMethod)
+    assert type(method) is QuarkW4A8LinearMethod
+    assert method.storage.name == "bf16"
 
 
 def test_serialized_svd_shape_not_svd_falls_back_to_plain(_supported):
     """A serialized SVD checkpoint folds the correction back into any layer the
-    SVD gate rejects, so such a layer must route to the plain checkpoint method."""
+    SVD gate rejects, so such a layer must route to the plain method (not BF16 --
+    the checkpoint carries a plain 4-bit weight there)."""
     from vllm_omni.quantization.quark_w4a8_config import (
         DiffusionQuarkW4A8Config,
-        QuarkW4A8CheckpointLinearMethod,
+        QuarkW4A8LinearMethod,
+        QuarkW4A8SVDLinearMethod,
     )
 
     cfg = DiffusionQuarkW4A8Config(svd_rank=32, is_checkpoint_w4a8_serialized=True)
     # 1152 % 32 == 0 (plain-tileable) but 1152 % 256 != 0 (not SVD-tileable).
     method = cfg.get_quant_method(_fake_linear(3072, 1152), "ffn")
-    assert isinstance(method, QuarkW4A8CheckpointLinearMethod)
+    assert type(method) is QuarkW4A8LinearMethod
+    assert not isinstance(method, QuarkW4A8SVDLinearMethod)
+    assert method.storage.name == "bf16"
+
+
+def test_online_svd_shape_not_svd_falls_back_to_bf16(_supported):
+    """Online svdquant (no serialized checkpoint) on an SVD-rejected shape has no
+    folded plain weight, so it must go to BF16 -- unlike the serialized case."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    from vllm_omni.quantization.quark_w4a8_config import DiffusionQuarkW4A8Config
+
+    method = DiffusionQuarkW4A8Config(svd_rank=32).get_quant_method(_fake_linear(3072, 1152), "ffn")
+    assert isinstance(method, UnquantizedLinearMethod)
 
 
 def test_serialized_untileable_falls_back_to_bf16(_supported):
@@ -351,16 +372,17 @@ def test_serialized_untileable_falls_back_to_bf16(_supported):
     ("output_partition_sizes", "expected_rank"),
     [([1024, 1024, 1024], 96), ([5120], 32)],
 )
-def test_svd_checkpoint_create_weights_rank_from_shards(_supported, output_partition_sizes, expected_rank):
+def test_svd_serialized_create_weights_rank_from_shards(_supported, output_partition_sizes, expected_rank):
     """rank_eff = svd_rank * len(output_partition_sizes): 3*R for a fused to_qkv
     (three shards), R for a single-shard linear."""
     from vllm_omni.quantization.quark_w4a8_config import (
+        _STORAGES,
         DiffusionQuarkW4A8Config,
-        QuarkW4A8SVDCheckpointLinearMethod,
+        QuarkW4A8SVDLinearMethod,
     )
 
     cfg = DiffusionQuarkW4A8Config(svd_rank=32, is_checkpoint_w4a8_serialized=True)
-    method = QuarkW4A8SVDCheckpointLinearMethod(cfg)
+    method = QuarkW4A8SVDLinearMethod(cfg, _STORAGES["bf16"], derive_factors=False)
     layer = torch.nn.Module()
     out = sum(output_partition_sizes)
     method.create_weights(
@@ -390,38 +412,41 @@ def test_from_config_parses_export_format():
     assert DiffusionQuarkW4A8Config.from_config({}).quark_export_format is None
 
 
-def test_serialized_packed_svd_routes_to_packed_method(_supported):
+def test_serialized_packed_svd_routes(_supported):
     from vllm_omni.quantization.quark_w4a8_config import (
         DiffusionQuarkW4A8Config,
-        QuarkW4A8SVDPackedLinearMethod,
+        QuarkW4A8SVDLinearMethod,
     )
 
     cfg = DiffusionQuarkW4A8Config(svd_rank=32, is_checkpoint_w4a8_serialized=True, quark_export_format="mxfp4_packed")
     method = cfg.get_quant_method(_fake_linear(5120, 5120), "to_q")
-    assert isinstance(method, QuarkW4A8SVDPackedLinearMethod)
+    assert isinstance(method, QuarkW4A8SVDLinearMethod)
+    assert method.storage.name == "mxfp4_packed"
 
 
-def test_serialized_packed_plain_routes_to_packed_method(_supported):
+def test_serialized_packed_plain_routes(_supported):
     from vllm_omni.quantization.quark_w4a8_config import (
         DiffusionQuarkW4A8Config,
-        QuarkW4A8PackedLinearMethod,
+        QuarkW4A8LinearMethod,
     )
 
     cfg = DiffusionQuarkW4A8Config(is_checkpoint_w4a8_serialized=True, quark_export_format="mxfp4_packed")
     method = cfg.get_quant_method(_fake_linear(5120, 5120), "to_q")
-    assert isinstance(method, QuarkW4A8PackedLinearMethod)
+    assert type(method) is QuarkW4A8LinearMethod
+    assert method.storage.name == "mxfp4_packed"
 
 
 def test_packed_create_weights_registers_uint8_shapes(_supported):
     """weight_shuffle is (N, K/2) and weight_scale (N, K/32), both uint8; K%256==0
     guarantees the scale needs no padding."""
     from vllm_omni.quantization.quark_w4a8_config import (
+        _STORAGES,
         DiffusionQuarkW4A8Config,
-        QuarkW4A8SVDPackedLinearMethod,
+        QuarkW4A8SVDLinearMethod,
     )
 
     cfg = DiffusionQuarkW4A8Config(svd_rank=32, is_checkpoint_w4a8_serialized=True, quark_export_format="mxfp4_packed")
-    method = QuarkW4A8SVDPackedLinearMethod(cfg)
+    method = QuarkW4A8SVDLinearMethod(cfg, _STORAGES["mxfp4_packed"], derive_factors=False)
     layer = torch.nn.Module()
     method.create_weights(
         layer,
@@ -446,23 +471,27 @@ def test_packed_create_weights_registers_uint8_shapes(_supported):
 def test_serialized_unshuffled_plain_routes(_supported):
     from vllm_omni.quantization.quark_w4a8_config import (
         DiffusionQuarkW4A8Config,
-        QuarkW4A8UnshuffledLinearMethod,
+        QuarkW4A8LinearMethod,
     )
 
     cfg = DiffusionQuarkW4A8Config(is_checkpoint_w4a8_serialized=True, quark_export_format="mxfp4_unshuffled")
-    assert isinstance(cfg.get_quant_method(_fake_linear(5120, 5120), "to_q"), QuarkW4A8UnshuffledLinearMethod)
+    method = cfg.get_quant_method(_fake_linear(5120, 5120), "to_q")
+    assert type(method) is QuarkW4A8LinearMethod
+    assert method.storage.name == "mxfp4_unshuffled"
 
 
 def test_serialized_unshuffled_svd_routes(_supported):
     from vllm_omni.quantization.quark_w4a8_config import (
         DiffusionQuarkW4A8Config,
-        QuarkW4A8SVDUnshuffledLinearMethod,
+        QuarkW4A8SVDLinearMethod,
     )
 
     cfg = DiffusionQuarkW4A8Config(
         svd_rank=32, is_checkpoint_w4a8_serialized=True, quark_export_format="mxfp4_unshuffled"
     )
-    assert isinstance(cfg.get_quant_method(_fake_linear(5120, 5120), "to_q"), QuarkW4A8SVDUnshuffledLinearMethod)
+    method = cfg.get_quant_method(_fake_linear(5120, 5120), "to_q")
+    assert isinstance(method, QuarkW4A8SVDLinearMethod)
+    assert method.storage.name == "mxfp4_unshuffled"
 
 
 def test_unshuffled_plain_create_weights_shardable_params(_supported):
@@ -471,12 +500,13 @@ def test_unshuffled_plain_create_weights_shardable_params(_supported):
     from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 
     from vllm_omni.quantization.quark_w4a8_config import (
+        _STORAGES,
         DiffusionQuarkW4A8Config,
-        QuarkW4A8UnshuffledLinearMethod,
+        QuarkW4A8LinearMethod,
     )
 
     cfg = DiffusionQuarkW4A8Config(is_checkpoint_w4a8_serialized=True, quark_export_format="mxfp4_unshuffled")
-    method = QuarkW4A8UnshuffledLinearMethod(cfg)
+    method = QuarkW4A8LinearMethod(cfg, _STORAGES["mxfp4_unshuffled"])
     layer = torch.nn.Module()
     method.create_weights(
         layer,
@@ -499,14 +529,15 @@ def test_unshuffled_svd_create_weights_replicates_proj_down(_supported):
     from vllm.model_executor.parameter import BasevLLMParameter, ModelWeightParameter
 
     from vllm_omni.quantization.quark_w4a8_config import (
+        _STORAGES,
         DiffusionQuarkW4A8Config,
-        QuarkW4A8SVDUnshuffledLinearMethod,
+        QuarkW4A8SVDLinearMethod,
     )
 
     cfg = DiffusionQuarkW4A8Config(
         svd_rank=32, is_checkpoint_w4a8_serialized=True, quark_export_format="mxfp4_unshuffled"
     )
-    method = QuarkW4A8SVDUnshuffledLinearMethod(cfg)
+    method = QuarkW4A8SVDLinearMethod(cfg, _STORAGES["mxfp4_unshuffled"], derive_factors=False)
     layer = torch.nn.Module()
     method.create_weights(
         layer,
@@ -524,14 +555,15 @@ def test_unshuffled_svd_create_weights_replicates_proj_down(_supported):
 def test_unshuffled_svd_rejects_row_parallel_tp(_supported):
     """Row-parallel SVD needs an all-reduce of the low-rank term; refuse it."""
     from vllm_omni.quantization.quark_w4a8_config import (
+        _STORAGES,
         DiffusionQuarkW4A8Config,
-        QuarkW4A8SVDUnshuffledLinearMethod,
+        QuarkW4A8SVDLinearMethod,
     )
 
     cfg = DiffusionQuarkW4A8Config(
         svd_rank=32, is_checkpoint_w4a8_serialized=True, quark_export_format="mxfp4_unshuffled"
     )
-    method = QuarkW4A8SVDUnshuffledLinearMethod(cfg)
+    method = QuarkW4A8SVDLinearMethod(cfg, _STORAGES["mxfp4_unshuffled"], derive_factors=False)
     layer = torch.nn.Module()
     layer.tp_size = 2
     with pytest.raises(NotImplementedError, match="row-parallel"):

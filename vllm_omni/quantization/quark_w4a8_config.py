@@ -29,34 +29,30 @@ the residual, keeping the factors as non-persistent buffers. This online SVD is 
 ``_low_rank_split``).
 
 **Serialized (calibrated checkpoint)** -- *calibrated W4A8 SVD*. A checkpoint
-produced offline by
-``examples/quantization/export_quark_svdquant_w4a8.py`` (Quark's
-``SVDQuantProcessor``: SmoothQuant smoothing + exact SVD on the smoothed weight)
-carries the BF16 residual under ``weight`` and the calibrated factors under
-``proj_down`` / ``proj_up`` as ordinary checkpoint keys. Self-attention QKV is
-pre-fused in the exporter, so a fused ``to_qkv`` layer's factors have rank
-``3 * svd_rank``. :class:`QuarkW4A8SVDCheckpointLinearMethod` loads the factors
-instead of deriving them; :class:`QuarkW4A8CheckpointLinearMethod` handles the plain
-serialized case. The on-disk weights are unpacked BF16 (packed to the kernel layout
-at load), because the shuffled MXFP4 layout is kernel-specific rather than a stable
-format.
+produced offline by ``examples/quantization/export_quark_svdquant_w4a8.py``
+(Quark's ``SVDQuantProcessor``: SmoothQuant smoothing + exact SVD on the smoothed
+weight) carries the residual under ``weight`` and the calibrated factors under
+``proj_down`` / ``proj_up``. Self-attention QKV is pre-fused in the exporter, so a
+fused ``to_qkv`` layer's factors have rank ``3 * svd_rank``.
 
-Two opt-in on-disk 4-bit formats (``quark_export_format``), both ~4x smaller than
-BF16 and tied to the kernel's pack version:
+Implementation: two linear methods -- :class:`QuarkW4A8LinearMethod` (plain) and
+:class:`QuarkW4A8SVDLinearMethod` (adds the fused low-rank branch) -- delegate the
+residual's storage to a ``_Storage`` strategy, selected by ``quark_export_format``
+(a bad value is a ``KeyError`` at lookup, not a silent fallback):
 
-* ``mxfp4_packed`` -- residual *preshuffled* into the kernel layout
+* ``bf16`` (default) -- residual is BF16 on disk (or a stock weight), packed to
+  MXFP4 at load. **TP=1 only.**
+* ``mxfp4_packed`` -- residual *preshuffled* into the kernel layout on disk
   (``weight_shuffle``/``weight_scale``), fastest load, **TP=1 only** (the shuffle
-  bakes in K/N). :class:`QuarkW4A8PackedLinearMethod` / ...SVD variant.
+  bakes in K/N).
 * ``mxfp4_unshuffled`` -- residual in *natural* order (``weight_packed``/
   ``weight_scale``), shardable for **TP>1**; each rank shuffles its shard at load
-  via ``flydsl_w4a8.shuffle_for_kernel``. :class:`QuarkW4A8UnshuffledLinearMethod`
-  (plain, column- and row-parallel) / :class:`QuarkW4A8SVDUnshuffledLinearMethod`
-  (SVD, column-parallel only -- row-parallel needs an all-reduce of the low-rank
-  term, not yet wired).
+  via ``flydsl_w4a8.shuffle_for_kernel``.
 
-TP support: only the ``mxfp4_unshuffled`` methods allow TP>1; every other path
-calls ``_reject_tp``. TP>1 is wired but unvalidated on multi-GPU (dev box has 1
-GPU); TP=1 is bit-identical to the packed path.
+TP: ``_check_parallelism`` allows TP>1 only on the shardable (unshuffled) storage,
+and refuses row-parallel for the SVD method (the low-rank term would need an
+all-reduce). TP>1 is wired but unvalidated on multi-GPU (dev box has 1 GPU); TP=1
+is bit-identical to the packed path.
 """
 
 from __future__ import annotations
@@ -197,50 +193,22 @@ class DiffusionQuarkW4A8Config(QuantizationConfig):
 
         in_features, out_features = layer.input_size, layer.output_size
 
-        if self.is_checkpoint_w4a8_serialized:
-            # Serialized checkpoint (exported by export_quark_svdquant_w4a8.py): BF16
-            # residual + optional low-rank factors on disk, packed to MXFP4 at load.
-            # The exporter guarantees factors exist iff the fused shape passes
-            # supports_svd_shape, so shape routing here stays consistent with what
-            # the checkpoint actually carries.
-            fmt = self.quark_export_format
-            if self.svd_rank is not None and flydsl_w4a8.supports_svd_shape(in_features, out_features):
-                if fmt == "mxfp4_unshuffled":
-                    return QuarkW4A8SVDUnshuffledLinearMethod(self)
-                if fmt == "mxfp4_packed":
-                    return QuarkW4A8SVDPackedLinearMethod(self)
-                return QuarkW4A8SVDCheckpointLinearMethod(self)
-            if flydsl_w4a8.supports_shape(in_features, out_features):
-                if fmt == "mxfp4_unshuffled":
-                    return QuarkW4A8UnshuffledLinearMethod(self)
-                if fmt == "mxfp4_packed":
-                    return QuarkW4A8PackedLinearMethod(self)
-                return QuarkW4A8CheckpointLinearMethod(self)
-            logger.warning(
-                "quark_w4a8 (serialized): %s has shape (out=%d, in=%d), which the kernel "
-                "cannot tile; keeping this layer in BF16.",
-                prefix,
-                out_features,
-                in_features,
-            )
-            return UnquantizedLinearMethod()
+        # Residual storage: BF16 (packed at load) online, or the serialized
+        # checkpoint's on-disk format. An unknown quark_export_format is a clear
+        # KeyError here rather than a silent bf16 fallback.
+        storage = (
+            _STORAGES[self.quark_export_format or "bf16"] if self.is_checkpoint_w4a8_serialized else _STORAGES["bf16"]
+        )
 
-        if self.svd_rank is None:
-            if not flydsl_w4a8.supports_shape(in_features, out_features):
-                logger.warning(
-                    "quark_w4a8: %s has shape (out=%d, in=%d), which the W4A8 kernel cannot "
-                    "tile; keeping this layer in BF16.",
-                    prefix,
-                    out_features,
-                    in_features,
-                )
-                return UnquantizedLinearMethod()
-            return QuarkW4A8OnlineLinearMethod(self)
+        if self.svd_rank is not None and flydsl_w4a8.supports_svd_shape(in_features, out_features):
+            # Derive factors online (stock BF16); load them from a serialized checkpoint.
+            return QuarkW4A8SVDLinearMethod(self, storage, derive_factors=not self.is_checkpoint_w4a8_serialized)
 
-        if not flydsl_w4a8.supports_svd_shape(in_features, out_features):
-            # Quark refuses these shapes outright rather than emitting garbage
-            # (flydsl_svdquant_inference_linear.py:115-126). Wan's proj_out,
-            # out=192, is the motivating case.
+        if self.svd_rank is not None and not self.is_checkpoint_w4a8_serialized:
+            # Online svdquant on an SVD-rejected shape stays BF16 (the fused epilogue
+            # needs both dims >= 256 and a multiple of 256). A *serialized* checkpoint
+            # instead carries a plain 4-bit weight here -- the exporter folds the
+            # factors back into it -- so it falls through to the plain method below.
             logger.warning(
                 "quark_w4a8(svd_rank=%d): %s has shape (out=%d, in=%d); the fused SVD epilogue "
                 "requires both >= 256 and a multiple of 256. Keeping this layer in BF16.",
@@ -250,210 +218,69 @@ class DiffusionQuarkW4A8Config(QuantizationConfig):
                 in_features,
             )
             return UnquantizedLinearMethod()
-        return QuarkW4A8SVDOnlineLinearMethod(self)
+
+        if not flydsl_w4a8.supports_shape(in_features, out_features):
+            logger.warning(
+                "quark_w4a8: %s has shape (out=%d, in=%d), which the W4A8 kernel cannot "
+                "tile; keeping this layer in BF16.",
+                prefix,
+                out_features,
+                in_features,
+            )
+            return UnquantizedLinearMethod()
+        return QuarkW4A8LinearMethod(self, storage)
 
 
 # ---------------------------------------------------------------------------
 # Linear methods
+#
+# Three orthogonal axes -- residual storage (bf16 / packed / unshuffled MXFP4),
+# factor provenance (none / derived / loaded), forward op (plain / svd) --
+# expressed as two linear-method classes delegating storage to a ``_Storage``
+# strategy, rather than one class per combination. Mirrors upstream vLLM's
+# CompressedTensorsLinearMethod + CompressedTensorsScheme split.
 # ---------------------------------------------------------------------------
 
 
-def _reject_tp(layer: Module, variant: str) -> None:
-    """Refuse TP>1 rather than silently sharding the weight wrongly.
+def _init_layer_meta(
+    layer: Module,
+    input_size_per_partition: int,
+    output_partition_sizes: list[int],
+    params_dtype: torch.dtype,
+) -> None:
+    layer.logical_widths = output_partition_sizes
+    layer.input_size_per_partition = input_size_per_partition
+    layer.output_size_per_partition = sum(output_partition_sizes)
+    layer.orig_dtype = params_dtype
+    layer.weight_block_size = None
 
-    Plain W4A8 shards like any BF16 weight (each rank packs its own slice), but
-    it is untested here; the SVD branch additionally has no defined sharding for
-    ``proj_down``/``proj_up``, whose rank dimension is replicated.
-    """
-    tp_size = getattr(layer, "tp_size", 1)
-    if tp_size > 1:
-        raise NotImplementedError(f"quark_w4a8 ({variant}) has only been validated at TP=1, got tp_size={tp_size}.")
 
-
-class QuarkW4A8LinearMethod(MXFPLinearMethodBase):
-    """Plain W4A8: MXFP4 weight, dynamically quantized MXFP8 activation.
-
-    Load-time buffers, after ``process_weights_after_loading``:
-
-      ``_kernel_weight`` : MXFP4 e2m1, packed and shuffled for the FlyDSL GEMM
-      ``_kernel_scale``  : per-group-of-32 E8M0 exponents, same layout
-
-    Both are ``persistent=False``: they are derived from the BF16 checkpoint at
-    load and are tied to a specific kernel layout, so they must not leak into a
-    ``state_dict``. This mirrors Quark's own inference linear.
-
-    Forward path:
-      ``_quantize_activation`` passes through — activation quantization happens
-      inside the custom op, so that torch.compile sees one opaque node.
-    """
-
-    def __init__(self, quant_config: DiffusionQuarkW4A8Config) -> None:
-        self.quant_config = quant_config
-        self.out_dtype = torch.get_default_dtype()
-        flydsl_w4a8.register_ops()
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        _reject_tp(layer, "plain")
-        output_size_per_partition = sum(output_partition_sizes)
-
-        layer.logical_widths = output_partition_sizes
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
-        layer.orig_dtype = params_dtype
-        layer.weight_block_size = None
-
-        layer.register_parameter(
-            "weight",
-            ModelWeightParameter(
-                data=torch.empty(
-                    output_size_per_partition,
-                    input_size_per_partition,
-                    dtype=params_dtype,
-                ),
-                input_dim=1,
-                output_dim=0,
-                weight_loader=extra_weight_attrs.get("weight_loader"),
-            ),
+def _materialize_meta_weight(layer: Module) -> None:
+    """Meta -> real device for the lazy bf16 path when no real weight loaded
+    (dummy-weight init). A no-op once a checkpoint chunk has materialized it."""
+    if layer.weight is not None and layer.weight.device == torch.device("meta"):
+        weight = ModelWeightParameter(
+            data=torch.empty_like(layer.weight, device=layer._load_device),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=layer.weight.weight_loader,
         )
-
-    def process_weights_after_loading(self, layer: Module) -> None:
-        if getattr(layer, "_already_called_process_weights_after_loading", False):
-            return
-
-        packed, scale = flydsl_w4a8.pack_weight(layer.weight.data)
-        layer.register_buffer("_kernel_weight", packed, persistent=False)
-        layer.register_buffer("_kernel_scale", scale, persistent=False)
-
-        # Drop the BF16 copy immediately; on A14B the two experts are resident
-        # at once and the transient doubles peak load memory otherwise.
-        if isinstance(getattr(layer, "weight", None), torch.nn.Parameter):
-            delattr(layer, "weight")
-            layer.register_parameter("weight", None)
-
-        layer._already_called_process_weights_after_loading = True
-
-    def _quantize_activation(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
-        # Activation quantization to MXFP8 is inside the custom op called by
-        # _quant_matmul, so pass the raw activation through here.
-        return x, None
-
-    def _quant_matmul(
-        self,
-        x_q: torch.Tensor,
-        x_scale: torch.Tensor | None,
-        layer: torch.nn.Module,
-        bias: torch.Tensor | None,
-        ori_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        output = torch.ops.vllm_omni.flydsl_w4a8_gemm(
-            x_q,
-            layer._kernel_weight,
-            layer._kernel_scale,
-            bias,
-            layer.output_size_per_partition,
-        )
-        if output.dtype != ori_dtype:
-            output = output.to(ori_dtype)
-        return output
+        _copy_missing_attrs(layer.weight, weight)
+        layer.register_parameter("weight", weight)
+        initialize_single_dummy_weight(layer.weight)
 
 
-class QuarkW4A8OnlineLinearMethod(_LazyWeightMixin, QuarkW4A8LinearMethod):
-    """Plain W4A8 against a stock BF16 checkpoint.
-
-    MRO: QuarkW4A8OnlineLinearMethod -> _LazyWeightMixin -> QuarkW4A8LinearMethod
-         -> MXFPLinearMethodBase -> LinearMethodBase
-
-      create_weights  : _LazyWeightMixin  (meta device + patched loader, so the
-                        BF16 weight is materialised one layer at a time)
-      process_weights : here (meta -> materialise), then the base packs it
-      apply / ops     : QuarkW4A8LinearMethod / MXFPLinearMethodBase
-    """
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        _reject_tp(layer, "plain")
-        _LazyWeightMixin.create_weights(
-            self,
-            layer,
-            input_size_per_partition,
-            output_partition_sizes,
-            input_size,
-            output_size,
-            params_dtype,
-            **extra_weight_attrs,
-        )
-
-    def process_weights_after_loading(self, layer: Module) -> None:
-        if getattr(layer, "_already_called_process_weights_after_loading", False):
-            return
-
-        if layer.weight is not None and layer.weight.device == torch.device("meta"):
-            weight = ModelWeightParameter(
-                data=torch.empty_like(layer.weight, device=layer._load_device),
-                input_dim=1,
-                output_dim=0,
-                weight_loader=layer.weight.weight_loader,
-            )
-            _copy_missing_attrs(layer.weight, weight)
-            layer.register_parameter("weight", weight)
-            initialize_single_dummy_weight(layer.weight)
-
-        QuarkW4A8LinearMethod.process_weights_after_loading(self, layer)
+def _drop_bf16_weight(layer: Module) -> None:
+    # A14B holds both experts resident, so free the BF16 copy at load.
+    if isinstance(getattr(layer, "weight", None), torch.nn.Parameter):
+        delattr(layer, "weight")
+        layer.register_parameter("weight", None)
 
 
-class QuarkW4A8SVDLinearMethod(QuarkW4A8LinearMethod):
-    """W4A8 plus a rank-R low-rank correction fused into the GEMM epilogue.
-
-    The quantized operand is the residual ``Wr = W - L2 @ L1``; the correction
-    is carried by two unquantized BF16 tensors:
-
-      ``proj_down`` : (R, K)  — ``L1``, applied as ``d = x @ L1.T`` in BF16
-      ``proj_up``   : (N, R)  — ``L2``, fused into the epilogue as ``d @ L2.T``
-
-    This class holds only the forward path. Where the factors come from is the
-    subclass's business, and today the only answer is
-    :class:`QuarkW4A8SVDOnlineLinearMethod`, which derives them from the BF16
-    weight at load time -- see its docstring for why there is no checkpoint
-    variant.
-    """
-
-    def _quant_matmul(
-        self,
-        x_q: torch.Tensor,
-        x_scale: torch.Tensor | None,
-        layer: torch.nn.Module,
-        bias: torch.Tensor | None,
-        ori_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        output = torch.ops.vllm_omni.flydsl_w4a8_svd_gemm(
-            x_q,
-            layer._kernel_weight,
-            layer._kernel_scale,
-            layer.proj_down,
-            layer.proj_up,
-            bias,
-            layer.output_size_per_partition,
-        )
-        if output.dtype != ori_dtype:
-            output = output.to(ori_dtype)
-        return output
+def _swap_param_to_buffer(layer: Module, name: str, tensor: torch.Tensor) -> None:
+    if name in layer._parameters:
+        del layer._parameters[name]
+    layer.register_buffer(name, tensor.contiguous(), persistent=False)
 
 
 def _low_rank_split(weight: torch.Tensor, rank: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -487,19 +314,155 @@ def _low_rank_split(weight: torch.Tensor, rank: int) -> tuple[torch.Tensor, torc
     )
 
 
-class QuarkW4A8SVDOnlineLinearMethod(_LazyWeightMixin, QuarkW4A8SVDLinearMethod):
-    """SVD-corrected W4A8 against a stock BF16 checkpoint.
+# ---------------------------------------------------------------------------
+# Storage strategies: where the 4-bit operand comes from, how it reaches the
+# kernel buffers, and whether the on-disk tensors may be sharded for TP.
+# ---------------------------------------------------------------------------
 
-    The factors are derived from the weight at load time instead of read from
-    disk, for the same reason the plain variant quantizes at load time: no
-    exporter emits them. ``proj_down``/``proj_up`` are therefore registered as
-    non-persistent *buffers* in ``process_weights_after_loading`` rather than as
-    parameters in ``create_weights`` -- if they were parameters they would be
-    checkpoint keys that no checkpoint has.
 
-    MRO: -> _LazyWeightMixin -> QuarkW4A8SVDLinearMethod -> QuarkW4A8LinearMethod
-         -> MXFPLinearMethodBase -> LinearMethodBase
+class _Storage:
+    name: str
+    shardable: bool
+
+    def register(self, owner, layer, in_part, out_parts, in_size, out_size, dtype, extra) -> None:
+        raise NotImplementedError
+
+    def materialize(self, layer: Module) -> None:
+        pass
+
+    def install(self, layer: Module) -> tuple[torch.Tensor, torch.Tensor]:
+        raise NotImplementedError
+
+
+class Bf16Storage(_Storage):
+    """BF16 residual (stock weight or serialized bf16), quantized to MXFP4 at load.
+
+    Lazy (meta device + per-layer pack) when factors are derived or absent;
+    non-lazy when a serialized checkpoint also carries proj_down/proj_up, because
+    their load order relative to the weight is not guaranteed. Not shardable in
+    this build -- the per-rank pack is only validated at TP=1.
     """
+
+    name = "bf16"
+    shardable = False
+
+    def register(self, owner, layer, in_part, out_parts, in_size, out_size, dtype, extra) -> None:
+        if getattr(owner, "derive_factors", True):
+            _LazyWeightMixin.create_weights(owner, layer, in_part, out_parts, in_size, out_size, dtype, **extra)
+        else:
+            layer.register_parameter(
+                "weight",
+                ModelWeightParameter(
+                    data=torch.empty(sum(out_parts), in_part, dtype=dtype),
+                    input_dim=1,
+                    output_dim=0,
+                    weight_loader=extra.get("weight_loader"),
+                ),
+            )
+
+    def materialize(self, layer: Module) -> None:
+        _materialize_meta_weight(layer)
+
+    def install(self, layer: Module) -> tuple[torch.Tensor, torch.Tensor]:
+        packed, scale = flydsl_w4a8.pack_weight(layer.weight.data)
+        _drop_bf16_weight(layer)
+        return packed, scale
+
+
+class Mxfp4Storage(_Storage):
+    """4-bit residual on disk: (N, K/2) e2m1 pairs + (N, K/32) E8M0 scales.
+
+    ``shuffled=True`` is already in the GEMM's 16x16 tile layout: zero work at
+    load, but a logical slice is not a byte slice, so it is unshardable.
+    ``False`` is natural (N, K) order that each rank shards then shuffles -- what
+    enables TP>1. The two use different checkpoint keys so pointing the wrong
+    format at a checkpoint fails as a missing key instead of loading a permuted
+    tensor as natural-order and silently emitting garbage.
+    """
+
+    def __init__(self, shuffled: bool) -> None:
+        self.shuffled = shuffled
+        self.name = "mxfp4_packed" if shuffled else "mxfp4_unshuffled"
+        self.weight_key = "weight_shuffle" if shuffled else "weight_packed"
+        self.shardable = not shuffled
+
+    def register(self, owner, layer, in_part, out_parts, in_size, out_size, dtype, extra) -> None:
+        n, k, loader = sum(out_parts), in_part, extra.get("weight_loader")
+        # K is a multiple of 256 for any quantized layer (shape gate), so K/32 is
+        # a multiple of 8 and the E8M0 scale needs no padding -- shapes are exact.
+        if self.shuffled:
+            weight: ModelWeightParameter | PackedvLLMParameter = ModelWeightParameter(
+                data=torch.empty(n, k // 2, dtype=torch.uint8),
+                input_dim=None,
+                output_dim=0,
+                weight_loader=loader,
+            )
+            scale: ModelWeightParameter | GroupQuantScaleParameter = ModelWeightParameter(
+                data=torch.empty(n, k // 32, dtype=torch.uint8),
+                input_dim=None,
+                output_dim=0,
+                weight_loader=loader,
+            )
+        else:
+            weight = PackedvLLMParameter(
+                data=torch.empty(n, k // 2, dtype=torch.uint8),
+                input_dim=1,
+                output_dim=0,
+                packed_dim=1,
+                packed_factor=2,
+                weight_loader=loader,
+            )
+            scale = GroupQuantScaleParameter(
+                data=torch.empty(n, k // 32, dtype=torch.uint8),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=loader,
+            )
+        layer.register_parameter(self.weight_key, weight)
+        layer.register_parameter("weight_scale", scale)
+
+    def install(self, layer: Module) -> tuple[torch.Tensor, torch.Tensor]:
+        weight = getattr(layer, self.weight_key).data
+        scale = layer.weight_scale.data
+        for name in (self.weight_key, "weight_scale"):
+            layer._parameters.pop(name, None)
+        if self.shuffled:
+            # The GEMM op consumes the uint8 views directly.
+            return weight, scale
+        # Shuffle this rank's local shard into the kernel layout (TP=1 -> identical
+        # bytes to packing the whole weight; verified equal on gfx950).
+        return flydsl_w4a8.shuffle_for_kernel(weight, scale)
+
+
+_STORAGES: dict[str, _Storage] = {
+    "bf16": Bf16Storage(),
+    "mxfp4_packed": Mxfp4Storage(shuffled=True),
+    "mxfp4_unshuffled": Mxfp4Storage(shuffled=False),
+}
+
+
+# ---------------------------------------------------------------------------
+# Linear methods: lifecycle skeleton; storage + factor hooks fill in the rest.
+# ---------------------------------------------------------------------------
+
+
+class QuarkW4A8LinearMethod(MXFPLinearMethodBase):
+    """Plain W4A8: MXFP4 weight, dynamically quantized MXFP8 activation.
+
+    After ``process_weights_after_loading`` the layer holds ``_kernel_weight`` /
+    ``_kernel_scale`` (non-persistent uint8 buffers in the FlyDSL GEMM layout);
+    where those bytes come from is the ``storage``'s business.
+    ``_quantize_activation`` passes through -- activation quantization is inside
+    the custom op, so torch.compile sees one opaque node.
+    """
+
+    row_parallel_ok = True
+
+    def __init__(self, quant_config: DiffusionQuarkW4A8Config, storage: _Storage) -> None:
+        self.quant_config = quant_config
+        self.storage = storage
+        self.out_dtype = torch.get_default_dtype()
+        flydsl_w4a8.register_ops()
 
     def create_weights(
         self,
@@ -511,8 +474,9 @@ class QuarkW4A8SVDOnlineLinearMethod(_LazyWeightMixin, QuarkW4A8SVDLinearMethod)
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        _reject_tp(layer, "svd")
-        _LazyWeightMixin.create_weights(
+        self._check_parallelism(layer, input_size_per_partition, input_size)
+        _init_layer_meta(layer, input_size_per_partition, output_partition_sizes, params_dtype)
+        self.storage.register(
             self,
             layer,
             input_size_per_partition,
@@ -520,431 +484,167 @@ class QuarkW4A8SVDOnlineLinearMethod(_LazyWeightMixin, QuarkW4A8SVDLinearMethod)
             input_size,
             output_size,
             params_dtype,
-            **extra_weight_attrs,
+            extra_weight_attrs,
         )
-        layer.svd_rank = self.quant_config.svd_rank
+        self._register_factors(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            params_dtype,
+            extra_weight_attrs.get("weight_loader"),
+        )
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
+        self.storage.materialize(layer)
+        # Before install: may rewrite layer.weight (online SVD) or swap loaded
+        # factor params to buffers.
+        self._prepare_factors(layer)
+        kernel_weight, kernel_scale = self.storage.install(layer)
+        layer.register_buffer("_kernel_weight", kernel_weight, persistent=False)
+        layer.register_buffer("_kernel_scale", kernel_scale, persistent=False)
+        layer._already_called_process_weights_after_loading = True
 
-        if layer.weight is not None and layer.weight.device == torch.device("meta"):
-            weight = ModelWeightParameter(
-                data=torch.empty_like(layer.weight, device=layer._load_device),
-                input_dim=1,
-                output_dim=0,
-                weight_loader=layer.weight.weight_loader,
-            )
-            _copy_missing_attrs(layer.weight, weight)
-            layer.register_parameter("weight", weight)
-            initialize_single_dummy_weight(layer.weight)
-
-        residual, proj_up, proj_down = _low_rank_split(layer.weight.data, layer.svd_rank)
-        layer.register_buffer("proj_down", proj_down, persistent=False)
-        layer.register_buffer("proj_up", proj_up, persistent=False)
-        layer.weight.data = residual
-
-        QuarkW4A8LinearMethod.process_weights_after_loading(self, layer)
-
-
-# ---------------------------------------------------------------------------
-# Serialized-checkpoint linear methods (offline calibrated export)
-# ---------------------------------------------------------------------------
-
-
-class QuarkW4A8CheckpointLinearMethod(QuarkW4A8OnlineLinearMethod):
-    """Plain W4A8 from a serialized checkpoint.
-
-    Mechanically identical to the online plain method -- a BF16 weight is loaded
-    one layer at a time and packed to MXFP4 -- the only difference being the
-    weight is real calibrated/stock data from disk rather than dummy-initialized.
-    Reusing the online method keeps the lazy per-layer pack (no whole-model BF16
-    transient at load).
-    """
-
-
-def _swap_param_to_buffer(layer: Module, name: str, tensor: torch.Tensor) -> None:
-    if name in layer._parameters:
-        del layer._parameters[name]
-    layer.register_buffer(name, tensor.contiguous(), persistent=False)
-
-
-class QuarkW4A8SVDCheckpointLinearMethod(QuarkW4A8SVDLinearMethod):
-    """SVD-corrected W4A8 from a serialized checkpoint.
-
-    The residual ``weight`` and the ``proj_down`` / ``proj_up`` factors are all
-    read from disk (unlike :class:`QuarkW4A8SVDOnlineLinearMethod`, which derives
-    the factors from the weight at load). The exporter pre-fuses self-attention
-    QKV, so a fused ``to_qkv`` layer carries rank ``3 * svd_rank``; the per-layer
-    rank is recovered from ``len(output_partition_sizes)``.
-
-    Not lazy: all three tensors must be loaded before packing, and their load
-    order in the checkpoint is not guaranteed, so packing waits for vLLM's
-    post-load ``process_weights_after_loading`` call.
-    """
-
-    def create_weights(
+    def _register_factors(
         self,
-        layer: torch.nn.Module,
+        layer: Module,
         input_size_per_partition: int,
         output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
         params_dtype: torch.dtype,
-        **extra_weight_attrs,
+        weight_loader,
     ) -> None:
-        _reject_tp(layer, "svd")
-        weight_loader = extra_weight_attrs.get("weight_loader")
-        output_size_per_partition = sum(output_partition_sizes)
+        pass
 
-        layer.logical_widths = output_partition_sizes
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
-        layer.orig_dtype = params_dtype
-        layer.weight_block_size = None
+    def _prepare_factors(self, layer: Module) -> None:
+        pass
 
+    def _check_parallelism(self, layer: Module, input_size_per_partition: int, input_size: int) -> None:
+        tp_size = getattr(layer, "tp_size", 1)
+        if tp_size > 1 and not self.storage.shardable:
+            raise NotImplementedError(
+                f"quark_w4a8: the {self.storage.name} residual format cannot be sharded; got tp_size={tp_size}."
+            )
+        # Row-parallel shards the input dim, so input_size_per_partition < input_size.
+        if tp_size > 1 and input_size_per_partition != input_size and not self.row_parallel_ok:
+            raise NotImplementedError(
+                "quark_w4a8 (svd): row-parallel TP needs an all-reduce of the low-rank term "
+                f"(not yet implemented). Got input sharded to {input_size_per_partition} of {input_size}."
+            )
+
+    def _quantize_activation(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
+        # Activation quantization to MXFP8 is inside the custom op called by
+        # _quant_matmul, so pass the raw activation through here.
+        return x, None
+
+    def _quant_matmul(
+        self,
+        x_q: torch.Tensor,
+        x_scale: torch.Tensor | None,
+        layer: torch.nn.Module,
+        bias: torch.Tensor | None,
+        ori_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        output = torch.ops.vllm_omni.flydsl_w4a8_gemm(
+            x_q,
+            layer._kernel_weight,
+            layer._kernel_scale,
+            bias,
+            layer.output_size_per_partition,
+        )
+        if output.dtype != ori_dtype:
+            output = output.to(ori_dtype)
+        return output
+
+
+class QuarkW4A8SVDLinearMethod(QuarkW4A8LinearMethod):
+    """W4A8 plus a rank-R low-rank correction fused into the GEMM epilogue.
+
+    The 4-bit operand is the residual ``Wr = W - L2 @ L1``; ``proj_down`` (R, K)
+    and ``proj_up`` (N, R) stay BF16. ``derive_factors`` picks the provenance:
+    online (``svd_lowrank`` at load) vs loaded from a serialized checkpoint.
+    Row-parallel TP is refused -- the low-rank term would need an all-reduce.
+    """
+
+    row_parallel_ok = False
+
+    def __init__(self, quant_config: DiffusionQuarkW4A8Config, storage: _Storage, derive_factors: bool) -> None:
+        super().__init__(quant_config, storage)
+        self.derive_factors = derive_factors
+
+    def _register_factors(
+        self,
+        layer: Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        params_dtype: torch.dtype,
+        weight_loader,
+    ) -> None:
+        if self.derive_factors:
+            return  # derived in _prepare_factors and registered as buffers
         # rank_eff is 3*svd_rank on a fused to_qkv (three output shards) and
         # svd_rank on a single-shard linear -- matching the exporter's fusion.
-        # svd_rank is always set here: routing only picks this method when it is.
-        assert self.quant_config.svd_rank is not None
-        rank_eff = self.quant_config.svd_rank * len(output_partition_sizes)
-
-        layer.register_parameter(
-            "weight",
-            ModelWeightParameter(
-                data=torch.empty(output_size_per_partition, input_size_per_partition, dtype=params_dtype),
-                input_dim=1,
-                output_dim=0,
-                weight_loader=weight_loader,
-            ),
-        )
-        layer.register_parameter(
-            "proj_down",
-            ModelWeightParameter(
-                data=torch.empty(rank_eff, input_size_per_partition, dtype=params_dtype),
-                input_dim=1,
-                output_dim=0,
-                weight_loader=weight_loader,
-            ),
-        )
+        rank = self.quant_config.svd_rank
+        assert rank is not None
+        rank_eff = rank * len(output_partition_sizes)
         layer.register_parameter(
             "proj_up",
             ModelWeightParameter(
-                data=torch.empty(output_size_per_partition, rank_eff, dtype=params_dtype),
+                data=torch.empty(sum(output_partition_sizes), rank_eff, dtype=params_dtype),
                 input_dim=1,
                 output_dim=0,
                 weight_loader=weight_loader,
             ),
         )
-
-    def process_weights_after_loading(self, layer: Module) -> None:
-        if getattr(layer, "_already_called_process_weights_after_loading", False):
-            return
-        proj_down = layer.proj_down.data
-        proj_up = layer.proj_up.data
-        # Packs the residual into _kernel_weight/_kernel_scale and drops the BF16
-        # weight. Deliberately skips _low_rank_split -- the factors are on disk.
-        QuarkW4A8LinearMethod.process_weights_after_loading(self, layer)
-        _swap_param_to_buffer(layer, "proj_down", proj_down)
-        _swap_param_to_buffer(layer, "proj_up", proj_up)
-        layer._already_called_process_weights_after_loading = True
-
-
-# ---------------------------------------------------------------------------
-# Pre-packed serialized checkpoints (--pack export: residual already in the
-# MXFP4 kernel layout on disk, no packing at load)
-# ---------------------------------------------------------------------------
-
-
-def _register_packed_weight(
-    layer: Module, input_size_per_partition: int, output_size_per_partition: int, weight_loader
-) -> None:
-    """Register the on-disk packed residual: ``weight_shuffle`` (N, K/2) and
-    ``weight_scale`` (N, K/32), both uint8.
-
-    K is always a multiple of 256 for a quantized layer (the shape gate enforces
-    it), so K/32 is a multiple of 8 and the E8M0 scale needs no padding -- the
-    shapes are exact. ``input_dim=None`` keeps the packed K axis unsharded;
-    ``output_dim=0`` lets the QKV/MLP shard loaders place row-slices (TP=1 only).
-    """
-    layer.register_parameter(
-        "weight_shuffle",
-        ModelWeightParameter(
-            data=torch.empty(output_size_per_partition, input_size_per_partition // 2, dtype=torch.uint8),
-            input_dim=None,
-            output_dim=0,
-            weight_loader=weight_loader,
-        ),
-    )
-    layer.register_parameter(
-        "weight_scale",
-        ModelWeightParameter(
-            data=torch.empty(output_size_per_partition, input_size_per_partition // 32, dtype=torch.uint8),
-            input_dim=None,
-            output_dim=0,
-            weight_loader=weight_loader,
-        ),
-    )
-
-
-def _install_packed_kernel_buffers(layer: Module) -> None:
-    """Hand the loaded packed bytes straight to the kernel buffers, no packing.
-
-    The GEMM op already consumes the uint8 views, so ``weight_shuffle`` /
-    ``weight_scale`` become ``_kernel_weight`` / ``_kernel_scale`` verbatim.
-    """
-    kernel_weight = layer.weight_shuffle.data
-    kernel_scale = layer.weight_scale.data
-    for name in ("weight_shuffle", "weight_scale"):
-        if name in layer._parameters:
-            del layer._parameters[name]
-    layer.register_buffer("_kernel_weight", kernel_weight, persistent=False)
-    layer.register_buffer("_kernel_scale", kernel_scale, persistent=False)
-
-
-class QuarkW4A8PackedLinearMethod(QuarkW4A8LinearMethod):
-    """Plain W4A8 from a pre-packed serialized checkpoint (``mxfp4_packed``)."""
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        _reject_tp(layer, "plain")
-        output_size_per_partition = sum(output_partition_sizes)
-        layer.logical_widths = output_partition_sizes
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
-        layer.orig_dtype = params_dtype
-        layer.weight_block_size = None
-        _register_packed_weight(
-            layer, input_size_per_partition, output_size_per_partition, extra_weight_attrs.get("weight_loader")
-        )
-
-    def process_weights_after_loading(self, layer: Module) -> None:
-        if getattr(layer, "_already_called_process_weights_after_loading", False):
-            return
-        _install_packed_kernel_buffers(layer)
-        layer._already_called_process_weights_after_loading = True
-
-
-class QuarkW4A8SVDPackedLinearMethod(QuarkW4A8SVDLinearMethod):
-    """SVD W4A8 from a pre-packed serialized checkpoint: packed residual on disk,
-    BF16 ``proj_down`` / ``proj_up`` factors alongside it."""
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        _reject_tp(layer, "svd")
-        weight_loader = extra_weight_attrs.get("weight_loader")
-        output_size_per_partition = sum(output_partition_sizes)
-        layer.logical_widths = output_partition_sizes
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
-        layer.orig_dtype = params_dtype
-        layer.weight_block_size = None
-        _register_packed_weight(layer, input_size_per_partition, output_size_per_partition, weight_loader)
-
-        assert self.quant_config.svd_rank is not None
-        rank_eff = self.quant_config.svd_rank * len(output_partition_sizes)
-        layer.register_parameter(
-            "proj_down",
-            ModelWeightParameter(
-                data=torch.empty(rank_eff, input_size_per_partition, dtype=params_dtype),
-                input_dim=1,
-                output_dim=0,
-                weight_loader=weight_loader,
-            ),
-        )
-        layer.register_parameter(
-            "proj_up",
-            ModelWeightParameter(
-                data=torch.empty(output_size_per_partition, rank_eff, dtype=params_dtype),
-                input_dim=1,
-                output_dim=0,
-                weight_loader=weight_loader,
-            ),
-        )
-
-    def process_weights_after_loading(self, layer: Module) -> None:
-        if getattr(layer, "_already_called_process_weights_after_loading", False):
-            return
-        proj_down = layer.proj_down.data
-        proj_up = layer.proj_up.data
-        _install_packed_kernel_buffers(layer)
-        _swap_param_to_buffer(layer, "proj_down", proj_down)
-        _swap_param_to_buffer(layer, "proj_up", proj_up)
-        layer._already_called_process_weights_after_loading = True
-
-
-# ---------------------------------------------------------------------------
-# Unshuffled serialized checkpoints (--pack-format unshuffled): natural-order
-# MXFP4 on disk, shardable for TP>1; each rank shuffles its shard at load.
-# ---------------------------------------------------------------------------
-
-
-def _register_unshuffled_weight(
-    layer: Module, input_size_per_partition: int, output_size_per_partition: int, weight_loader
-) -> None:
-    """Register the shardable unshuffled MXFP4 residual.
-
-    ``weight_packed`` (N, K/2) as a ``PackedvLLMParameter`` (packed 2-per-byte on
-    K) and ``weight_scale`` (N, K/32) as a ``GroupQuantScaleParameter`` -- the
-    standard vLLM classes that shard a packed weight and a per-group scale along
-    the TP dim. Column-parallel shards N (``output_dim=0``); row-parallel shards
-    K (``input_dim=1``). K is always a multiple of 256, so a K-shard stays a
-    multiple of 256 (kernel) and 32 (scale group).
-    """
-    layer.register_parameter(
-        "weight_packed",
-        PackedvLLMParameter(
-            data=torch.empty(output_size_per_partition, input_size_per_partition // 2, dtype=torch.uint8),
-            input_dim=1,
-            output_dim=0,
-            packed_dim=1,
-            packed_factor=2,
-            weight_loader=weight_loader,
-        ),
-    )
-    layer.register_parameter(
-        "weight_scale",
-        GroupQuantScaleParameter(
-            data=torch.empty(output_size_per_partition, input_size_per_partition // 32, dtype=torch.uint8),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=weight_loader,
-        ),
-    )
-
-
-def _install_unshuffled_kernel_buffers(layer: Module) -> None:
-    """Shuffle this rank's local shard into the kernel layout and drop the params.
-
-    Runs per rank after its shard is loaded, so the shuffle is applied to the
-    sharded (N/tp or K/tp) sub-matrix -- which is exactly what the per-rank GEMM
-    needs. At TP=1 this equals packing the whole weight (bytes verified equal).
-    """
-    kernel_weight, kernel_scale = flydsl_w4a8.shuffle_for_kernel(layer.weight_packed.data, layer.weight_scale.data)
-    for name in ("weight_packed", "weight_scale"):
-        if name in layer._parameters:
-            del layer._parameters[name]
-    layer.register_buffer("_kernel_weight", kernel_weight, persistent=False)
-    layer.register_buffer("_kernel_scale", kernel_scale, persistent=False)
-
-
-class QuarkW4A8UnshuffledLinearMethod(QuarkW4A8LinearMethod):
-    """Plain W4A8 from an unshuffled serialized checkpoint. TP>1 capable.
-
-    Both column-parallel (shard N) and row-parallel (shard K) work: vLLM shards
-    the natural-order ``weight_packed`` / ``weight_scale``, and each rank shuffles
-    its own shard into the kernel layout. Activations are quantized inside the
-    kernel per shard, so row-parallel needs no extra handling for the main GEMM.
-    """
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        output_size_per_partition = sum(output_partition_sizes)
-        layer.logical_widths = output_partition_sizes
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
-        layer.orig_dtype = params_dtype
-        layer.weight_block_size = None
-        _register_unshuffled_weight(
-            layer, input_size_per_partition, output_size_per_partition, extra_weight_attrs.get("weight_loader")
-        )
-
-    def process_weights_after_loading(self, layer: Module) -> None:
-        if getattr(layer, "_already_called_process_weights_after_loading", False):
-            return
-        _install_unshuffled_kernel_buffers(layer)
-        layer._already_called_process_weights_after_loading = True
-
-
-class QuarkW4A8SVDUnshuffledLinearMethod(QuarkW4A8SVDLinearMethod):
-    """SVD W4A8 from an unshuffled serialized checkpoint, column-parallel TP.
-
-    Column-parallel (QKV, gate/up): ``proj_up`` (N, R) shards on N, ``proj_down``
-    (R, K) is **replicated** (K full), so the low-rank term needs no communication
-    -- ``d = x @ proj_down.T`` is identical on every rank and the fused epilogue
-    runs per shard. Row-parallel (K shard) is refused: it would need an all-reduce
-    of the (M, R) low-rank intermediate before ``proj_up``, which is not yet wired.
-    """
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        weight_loader = extra_weight_attrs.get("weight_loader")
-        output_size_per_partition = sum(output_partition_sizes)
-        tp_size = getattr(layer, "tp_size", 1)
-        # Row-parallel shards the input dim, so input_size_per_partition < input_size.
-        if tp_size > 1 and input_size_per_partition != input_size:
-            raise NotImplementedError(
-                "quark_w4a8 (svd) supports column-parallel TP only; row-parallel needs "
-                "an all-reduce of the low-rank term (not yet implemented). Got input "
-                f"sharded to {input_size_per_partition} of {input_size}."
+        # Under column-parallel TP (shardable storage) proj_down (rank_eff, K) is
+        # replicated because K stays full, so it carries no shard metadata.
+        if self.storage.shardable:
+            layer.register_parameter(
+                "proj_down",
+                BasevLLMParameter(
+                    data=torch.empty(rank_eff, input_size_per_partition, dtype=params_dtype),
+                    weight_loader=weight_loader,
+                ),
+            )
+        else:
+            layer.register_parameter(
+                "proj_down",
+                ModelWeightParameter(
+                    data=torch.empty(rank_eff, input_size_per_partition, dtype=params_dtype),
+                    input_dim=1,
+                    output_dim=0,
+                    weight_loader=weight_loader,
+                ),
             )
 
-        layer.logical_widths = output_partition_sizes
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
-        layer.orig_dtype = params_dtype
-        layer.weight_block_size = None
-        _register_unshuffled_weight(layer, input_size_per_partition, output_size_per_partition, weight_loader)
+    def _prepare_factors(self, layer: Module) -> None:
+        if self.derive_factors:
+            assert self.quant_config.svd_rank is not None
+            residual, proj_up, proj_down = _low_rank_split(layer.weight.data, self.quant_config.svd_rank)
+            layer.weight.data = residual
+            layer.register_buffer("proj_down", proj_down, persistent=False)
+            layer.register_buffer("proj_up", proj_up, persistent=False)
+        else:
+            _swap_param_to_buffer(layer, "proj_down", layer.proj_down.data)
+            _swap_param_to_buffer(layer, "proj_up", layer.proj_up.data)
 
-        assert self.quant_config.svd_rank is not None
-        rank_eff = self.quant_config.svd_rank * len(output_partition_sizes)
-        # proj_up (N, rank_eff): shards on N with the output (column-parallel).
-        layer.register_parameter(
-            "proj_up",
-            ModelWeightParameter(
-                data=torch.empty(output_size_per_partition, rank_eff, dtype=params_dtype),
-                input_dim=1,
-                output_dim=0,
-                weight_loader=weight_loader,
-            ),
+    def _quant_matmul(
+        self,
+        x_q: torch.Tensor,
+        x_scale: torch.Tensor | None,
+        layer: torch.nn.Module,
+        bias: torch.Tensor | None,
+        ori_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        output = torch.ops.vllm_omni.flydsl_w4a8_svd_gemm(
+            x_q,
+            layer._kernel_weight,
+            layer._kernel_scale,
+            layer.proj_down,
+            layer.proj_up,
+            bias,
+            layer.output_size_per_partition,
         )
-        # proj_down (rank_eff, K): replicated -- K is full under column-parallel.
-        layer.register_parameter(
-            "proj_down",
-            BasevLLMParameter(
-                data=torch.empty(rank_eff, input_size_per_partition, dtype=params_dtype),
-                weight_loader=weight_loader,
-            ),
-        )
-
-    def process_weights_after_loading(self, layer: Module) -> None:
-        if getattr(layer, "_already_called_process_weights_after_loading", False):
-            return
-        proj_down = layer.proj_down.data
-        proj_up = layer.proj_up.data
-        _install_unshuffled_kernel_buffers(layer)
-        _swap_param_to_buffer(layer, "proj_down", proj_down)
-        _swap_param_to_buffer(layer, "proj_up", proj_up)
-        layer._already_called_process_weights_after_loading = True
+        if output.dtype != ori_dtype:
+            output = output.to(ori_dtype)
+        return output
