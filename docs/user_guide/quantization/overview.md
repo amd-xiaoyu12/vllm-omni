@@ -48,7 +48,7 @@ otherwise.
 | ModelOpt | [ModelOpt](modelopt.md) | Pre-quantized FP8 checkpoints | Qwen-Image, Z-Image, FLUX.2, HunyuanImage-3.0 | Validated for ModelOpt FP8 diffusion checkpoints |
 | MXFP8 W8A8 | [MXFP8](mxfp8.md) | Online W8A8 or offline pre-quantized | Wan2.2-T2V-A14B, I2V-A14B, TI2V-5B | Ascend NPU only; validated for Wan2.2 |
 | MXFP4 W4A4 | [MXFP4](mxfp4.md) | `mxfp4`: online single-scale only; `mxfp4_dualscale`: online or offline dual-scale (offline recommended) | Wan2.2-T2V-A14B, I2V-A14B | Ascend NPU only; validated for Wan2.2 A14B cascade models; TI2V-5B not supported; offline `mxfp4_dualscale` uses calibrated `mul_scale` for best accuracy |
-| W4A8 | [W4A8 on MI355X](w4a8_rocm.md) | `quark_w4a8`: online MXFP4 weight + dynamic MXFP8 activation; `quark_svdquant` adds a low-rank correction branch | Wan2.2-TI2V-5B, T2V-A14B | AMD gfx950 only; no checkpoint prep needed; `quark_svdquant` has no exporter yet |
+| W4A8 | [W4A8 on MI355X](w4a8_rocm.md) | Three tiers: plain W4A8 (RTN) via `quark_w4a8`; online / calibrated W4A8 SVD via `quark_svdquant` (low-rank correction, calibrated when served from an offline export) | Wan2.2-TI2V-5B, T2V-A14B | AMD gfx950 only; MXFP4 weight + dynamic MXFP8 activation; plain and online SVD need no checkpoint prep, calibrated SVD needs one offline export |
 | AutoRound | [AutoRound](autoround.md) | Pre-quantized W4A16 checkpoints | FLUX.1-dev; Qwen-Image/Wan2.2 not validated | Checkpoint-driven |
 | msModelSlim | [msModelSlim](msmodelslim.md) | Pre-quantized Ascend checkpoints | Wan2.2 recipe; HunyuanImage-3.0 inference target | Ascend/NPU path |
 

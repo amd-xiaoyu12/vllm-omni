@@ -11,32 +11,50 @@ The GEMM comes from AMD Quark's FlyDSL kernels and needs CDNA4 scaled MFMA, so
 it runs on **gfx950 (MI355X) only**. CDNA3 (gfx942 / MI325X) has neither scaled
 MFMA nor native FP4.
 
-Two methods share one implementation:
+Three accuracy tiers across two `--quantization` methods (all one kernel launch):
 
-| Method | Computes | Checkpoint needed | Status |
+| Tier | `--quantization` | Correction branch | Offline setup |
 | --- | --- | --- | --- |
-| `quark_w4a8` | `y = Q(x) @ Q(W).T + bias` | Stock BF16 | Ready |
-| `quark_svdquant` | `y = Q(x) @ Q(Wr).T + (x @ L1.T) @ L2.T + bias` | Stock BF16 (online) or calibrated export | Ready; online uncalibrated, offline calibrated (see below) |
+| **plain W4A8 (RTN)** | `quark_w4a8` | none | none |
+| **online W4A8 SVD** | `quark_svdquant` | low-rank, derived at load (uncalibrated) | none |
+| **calibrated W4A8 SVD** | `quark_svdquant` | low-rank, activation-calibrated | one export |
 
-`quark_svdquant` adds a rank-R BF16 correction branch. `Wr = W - L2 @ L1` is the
-4-bit residual and the up-projection `d @ L2.T` is fused into the GEMM epilogue,
-so both methods are a single kernel launch. The low-rank branch absorbs the
-weight's dominant singular directions, leaving a residual with a narrower
-dynamic range that quantizes more accurately.
+### How each tier works
 
-Both methods can read a **stock BF16 checkpoint** and do all their work at load
-time (the *online* path). For the SVD variant they can also read a **calibrated
-serialized checkpoint** produced offline — see [Offline calibrated
-export](#offline-calibrated-export).
+All three share one runtime: at inference the BF16 activation is quantized to
+**MXFP8 inside the kernel**, then multiplied against the **MXFP4 weight** on the
+CDNA4 scaled-MFMA GEMM — one kernel launch, BF16 out plus bias. They differ only
+in how the weight (and, for SVD, the correction) is prepared:
 
-!!! warning "The online `quark_svdquant` is an uncalibrated weight SVD"
+- **plain W4A8 (RTN)** — each BF16 weight is round-to-nearest quantized to MXFP4
+  and packed at load; the BF16 copy is freed. No correction branch:
+  `y = Q(x) @ Q(W).T + bias`.
+- **online W4A8 SVD** — same, plus a rank-R branch derived from the weight *at
+  load* with `torch.svd_lowrank`. Only the residual `Wr = W - L2·L1` is 4-bit;
+  `L1`/`L2` stay BF16 and `d @ L2.T` is fused into the GEMM epilogue. Zero setup,
+  but uncalibrated (sees the weight only).
+- **calibrated W4A8 SVD** — the residual and `L1`/`L2` come from an offline Quark
+  calibration (SmoothQuant + exact SVD on the smoothed weight) and are read from
+  the checkpoint. Same runtime as online SVD, higher accuracy.
+
+The SVD tiers are the **same method** (`quark_svdquant`); the checkpoint
+(`is_checkpoint_w4a8_serialized`) picks online vs calibrated. Their low-rank branch
+absorbs the weight's dominant singular directions, leaving a residual with a
+narrower dynamic range that quantizes more accurately.
+
+**plain W4A8 (RTN)** and **online W4A8 SVD** read a stock BF16 checkpoint and do all
+their work at load — no offline step. **calibrated W4A8 SVD** reads a serialized
+checkpoint produced offline (see [Offline calibrated
+export](#offline-calibrated-export)).
+
+!!! warning "online W4A8 SVD is an uncalibrated weight SVD"
     The published SVDQuant method derives `L1` / `L2` from calibration
     activations, which also migrates activation outliers into the low-rank
-    branch. The **online** path instead takes a randomized truncated SVD of the
+    branch. **online W4A8 SVD** instead takes a randomized truncated SVD of the
     weight alone (`torch.svd_lowrank`), so you get the low-rank correction and
     none of the outlier migration. Treat its accuracy as a floor.
 
-    The **offline** path (`is_checkpoint_w4a8_serialized`) closes that gap: it
+    **calibrated W4A8 SVD** (`is_checkpoint_w4a8_serialized`) closes that gap: it
     runs Quark's `SVDQuantProcessor` (SmoothQuant smoothing + exact SVD on the
     smoothed weight) and ships the calibrated factors in the checkpoint.
 
@@ -114,10 +132,11 @@ not claimed; it belongs to Nunchaku upstream.
 
 ## Offline calibrated export
 
-The online path is convenient but sees only the raw weight. To get the published
-SVDQuant accuracy — activation-aware smoothing plus an exact SVD — export a
-calibrated checkpoint once with `examples/quantization/export_quark_svdquant_w4a8.py`
-and serve it with `is_checkpoint_w4a8_serialized`.
+**online W4A8 SVD** is convenient but sees only the raw weight. **calibrated W4A8
+SVD** gets the published SVDQuant accuracy — activation-aware smoothing plus an
+exact SVD — by exporting a checkpoint once with
+`examples/quantization/export_quark_svdquant_w4a8.py` and serving it with
+`is_checkpoint_w4a8_serialized`.
 
 ```bash
 # One-time offline export (needs Quark + a gfx950 GPU; ~tens of minutes on A14B).

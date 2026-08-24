@@ -4,27 +4,32 @@
 
 MXFP4 weights (groups of 32 K-elements sharing one ``float8_e8m0fnu`` exponent)
 multiplied against MXFP8 activations that are quantized *dynamically* inside the
-kernel. Two variants share this config, selected by ``svd_rank``:
+kernel. Three accuracy tiers, selected by ``svd_rank`` and the checkpoint:
 
-  ``svd_rank`` absent   plain      ``y = Q(x) @ Q(W).T + bias``
-  ``svd_rank`` present  SVDQuant   ``y = Q(x) @ Q(Wr).T + (x @ L1.T) @ L2.T + bias``
+  **plain W4A8 (RTN)**       ``svd_rank`` absent   ``y = Q(x) @ Q(W).T + bias``
+  **online W4A8 SVD**        ``svd_rank`` present, stock BF16 checkpoint
+  **calibrated W4A8 SVD**    ``svd_rank`` present, serialized checkpoint
+
+  SVD tiers: ``y = Q(x) @ Q(Wr).T + (x @ L1.T) @ L2.T + bias``
 
 where ``Wr = W - L2 @ L1`` is the 4-bit residual and the low-rank up-projection
-is fused into the GEMM epilogue, so both variants are one kernel launch.
+is fused into the GEMM epilogue, so every tier is one kernel launch.
 
 Checkpoint contract
 -------------------
 Two load modes, chosen by ``is_checkpoint_w4a8_serialized``:
 
-**Online (default, stock BF16 checkpoint).** Both variants read a stock BF16
-checkpoint and do all their work at load time -- no export step, nothing extra in
-the state dict. ``plain`` packs each weight to MXFP4 (RTN) as it loads; ``SVDQuant``
-additionally derives ``proj_down`` (R, K) / ``proj_up`` (N, R) from the weight with
-``torch.svd_lowrank`` and quantizes only the residual, keeping the factors as
-non-persistent buffers. This online SVD is a *weight* SVD, not the activation-aware
-smoothing the paper describes (see ``_low_rank_split``).
+**Online (default, stock BF16 checkpoint)** -- *plain W4A8 (RTN)* and *online W4A8
+SVD*. Both read a stock BF16 checkpoint and do all their work at load time -- no
+export step, nothing extra in the state dict. ``plain`` packs each weight to MXFP4
+(RTN) as it loads; the SVD tier additionally derives ``proj_down`` (R, K) /
+``proj_up`` (N, R) from the weight with ``torch.svd_lowrank`` and quantizes only
+the residual, keeping the factors as non-persistent buffers. This online SVD is a
+*weight* SVD, not the activation-aware smoothing the paper describes (see
+``_low_rank_split``).
 
-**Serialized (calibrated checkpoint).** A checkpoint produced offline by
+**Serialized (calibrated checkpoint)** -- *calibrated W4A8 SVD*. A checkpoint
+produced offline by
 ``examples/quantization/export_quark_svdquant_w4a8.py`` (Quark's
 ``SVDQuantProcessor``: SmoothQuant smoothing + exact SVD on the smoothed weight)
 carries the BF16 residual under ``weight`` and the calibrated factors under
