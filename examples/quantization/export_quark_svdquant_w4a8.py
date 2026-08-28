@@ -61,6 +61,23 @@ DEFAULT_CALIB_PROMPTS = [
     "A hot air balloon drifting over a patchwork of autumn fields.",
 ]
 
+
+def _load_calib_prompts(args: argparse.Namespace) -> list[str]:
+    """Calibration prompts: from --prompts_file if given, else the built-in defaults.
+
+    The file is either a JSON list of strings, or a dict with a --prompts_key
+    (default "train") holding a list of strings (e.g. the VBench prompts_split.json).
+    """
+    if not getattr(args, "prompts_file", None):
+        return DEFAULT_CALIB_PROMPTS
+    with open(args.prompts_file) as handle:
+        data = json.load(handle)
+    prompts = data if isinstance(data, list) else data[args.prompts_key]
+    if not prompts or not all(isinstance(p, str) for p in prompts):
+        raise ValueError(f"--prompts_file {args.prompts_file} did not yield a list of strings")
+    return prompts
+
+
 # Quark's SVDQuant exclude set for Wan (input/output embedders and the tiny
 # out-projection that the FlyDSL SVD epilogue refuses anyway).
 WAN_SVDQUANT_EXCLUDE = [
@@ -141,7 +158,13 @@ def _fuse_qkv(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
 
 
 def build_omni_state_dict(model: torch.nn.Module, variant: str, fuse_qkv: bool) -> dict[str, torch.Tensor]:
-    """Remap a (post-``apply()``) model's state_dict into vLLM-Omni's layout."""
+    """Remap a (post-``apply()``) model's state_dict into vLLM-Omni's layout.
+
+    Quark's SVDQuant already folds the SmoothQuant factor ``1/s`` into the residual
+    and ``L1`` at ``apply()`` time (``ErrorCorrectedModule`` is built with
+    ``smooth_factor=None``), so the exported factors are self-contained and need no
+    runtime activation scaling -- nothing to do here for smoothing.
+    """
     sd: dict[str, torch.Tensor] = {}
     for key, value in model.state_dict().items():
         if not isinstance(value, torch.Tensor):
@@ -229,7 +252,8 @@ def quantize_component(pipe, comp: str, args: argparse.Namespace) -> dict[str, t
     from quark.torch.quantization.config.config import SVDQuantConfig
     from quark.torch.utils.diffusers.calibration import get_calib_dataloader
 
-    prompts = DEFAULT_CALIB_PROMPTS[: args.n_calib_prompts]
+    prompts = _load_calib_prompts(args)[: args.n_calib_prompts]
+    print(f"[export] {comp}: calibrating on {len(prompts)} prompts")
     t0 = time.time()
     dataloader = get_calib_dataloader(
         pipe,
@@ -289,6 +313,19 @@ def write_component(out_dir: str, comp: str, sd: dict[str, torch.Tensor], args: 
         quant_config["packing"] = "flydsl_a8w4_preshuffle"
     if args.variant == "svdquant":
         quant_config["svd_rank"] = args.svd_rank
+
+    # vLLM-Omni discovers the quant config from the ``quantization_config`` key inside
+    # the transformer's config.json (diffusers ConfigMixin config), not a standalone
+    # file -- embed it there so the exported directory is directly loadable. A copy is
+    # also written to quant_config.json for human reference.
+    base_config: dict = {}
+    src_config = os.path.join(args.model, comp, "config.json")
+    if os.path.exists(src_config):
+        with open(src_config) as handle:
+            base_config = json.load(handle)
+    base_config["quantization_config"] = quant_config
+    with open(os.path.join(comp_dir, "config.json"), "w") as handle:
+        json.dump(base_config, handle, indent=2)
     with open(os.path.join(comp_dir, "quant_config.json"), "w") as handle:
         json.dump({"quantization_config": quant_config}, handle, indent=2)
 
@@ -311,6 +348,8 @@ def parse_args() -> argparse.Namespace:
         "packed: preshuffled MXFP4 (~4x smaller, fastest load, TP=1 only). "
         "unshuffled: natural-order MXFP4 (~4x smaller, shardable for TP>1, shuffled per shard at load).",
     )
+    p.add_argument("--prompts_file", default=None, help="JSON list of prompts, or a dict keyed by --prompts_key.")
+    p.add_argument("--prompts_key", default="train", help="Key into --prompts_file when it is a dict.")
     p.add_argument("--n_calib_prompts", type=int, default=2)
     p.add_argument("--n_calib_steps", type=int, default=20)
     p.add_argument("--num_frames", type=int, default=17)
@@ -347,11 +386,16 @@ def main() -> int:
             sd = _pack_residuals(sd, unshuffled=args.pack_format == "unshuffled")
         write_component(args.output_dir, comp, sd, args)
 
-    print(f"[export] DONE -> {args.output_dir}")
-    print(
-        "[export] copy/symlink the non-transformer pipeline components "
-        "(vae, text_encoder, scheduler, model_index.json) into the output dir to make it loadable."
-    )
+    # Symlink the non-transformer pipeline components so --output_dir is directly
+    # loadable (the transformer dirs are the quantized exports we just wrote).
+    for entry in os.listdir(args.model):
+        if entry in comps:
+            continue
+        dst = os.path.join(args.output_dir, entry)
+        if not os.path.exists(dst):
+            os.symlink(os.path.join(args.model, entry), dst)
+
+    print(f"[export] DONE -> {args.output_dir} (loadable; non-transformer components symlinked)")
     return 0
 
 
