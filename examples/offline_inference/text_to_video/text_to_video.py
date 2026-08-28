@@ -316,8 +316,8 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8"],
-        help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 (NPU). mxfp4: W4A4 MXFP4 (NPU). mxfp4_dualscale: W4A4 MXFP4 dual-scale + BF16 fallback mixed (NPU). fp8: online FP8 (GPU).",
+        choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8", "quark_w4a8", "quark_svdquant"],
+        help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 (NPU). mxfp4: W4A4 MXFP4 (NPU). mxfp4_dualscale: W4A4 MXFP4 dual-scale + BF16 fallback mixed (NPU). fp8: online FP8 (GPU). quark_w4a8: W4A8 MXFP4+MXFP8 RTN (ROCm gfx950). quark_svdquant: W4A8 with SVDQuant low-rank correction (ROCm gfx950).",
     )
 
     # Distributed and parallel execution
