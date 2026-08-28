@@ -1118,7 +1118,12 @@ class WanTransformer3DModel(nn.Module):
             # Pre-fused to_qkv tensors (from offline MXFP8 merged checkpoint) fall
             # through to the else branch and are loaded directly.
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in original_name:
+                # Match a full path segment (trailing dot): ``.attn1.to_q.`` must not
+                # match a pre-fused ``.attn1.to_qkv.`` key -- otherwise the fused
+                # to_qkv weight/proj_down/proj_up enter the shard branch, build a
+                # garbage lookup name (to_qkv->to_qkvkv), miss params_dict, and break
+                # out unloaded, leaving the layer at uninitialized garbage.
+                if (weight_name + ".") not in original_name:
                     continue
                 lookup_name = original_name.replace(weight_name, param_name)
                 # Skip weights that belong to PP stages other than this one
